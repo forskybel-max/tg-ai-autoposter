@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from telethon import TelegramClient, events, utils
+from telethon.extensions import html as tg_html
 from telethon.sessions import StringSession
 from telethon.errors import (
     InviteRequestSentError,
@@ -16,7 +17,7 @@ from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
     ImportChatInviteRequest,
 )
-from telethon.tl.types import ChatInviteAlready, Message
+from telethon.tl.types import ChatInviteAlready, DocumentAttributeVideo, Message
 
 from app.ai_service import AIService
 from app.config import Config, MEDIA_DIR
@@ -345,7 +346,11 @@ class UserbotParser:
         original_text = ""
         for m in messages:
             if m.message and m.message.strip():
-                original_text = m.message.strip()
+                # Извлекаем текст вместе со скрытыми гиперссылками (<a href="...">), чтобы не терять ссылки на сервисы
+                if m.entities:
+                    original_text = tg_html.unparse(m.message, m.entities).strip()
+                else:
+                    original_text = m.message.strip()
                 break
 
         source = await self.db.get_source(chat_id)
@@ -431,9 +436,9 @@ class UserbotParser:
 
     async def _download_media(
         self, chat_id: int, messages: list[Message]
-    ) -> list[dict[str, str]]:
+    ) -> list[dict]:
         max_bytes = self.config.max_media_size_mb * 1024 * 1024
-        downloaded: list[dict[str, str]] = []
+        downloaded: list[dict] = []
 
         for m in messages:
             if not m.media:
@@ -442,7 +447,7 @@ class UserbotParser:
             media_type: str | None = None
             if m.photo:
                 media_type = "photo"
-            elif m.video and not m.gif and not m.sticker:
+            elif (m.video or m.gif) and not m.sticker and not m.video_note:
                 if m.file and m.file.size and m.file.size > max_bytes:
                     logger.warning(
                         "Видео в посте %s слишком большое (%d МБ > %d МБ), пропускаем файл.",
@@ -462,10 +467,37 @@ class UserbotParser:
                 saved_path = await self.client.download_media(
                     m, file=str(target_file)
                 )
-                if saved_path and Path(saved_path).exists():
-                    downloaded.append(
-                        {"path": str(saved_path), "type": media_type}
-                    )
+                if not saved_path or not Path(saved_path).exists():
+                    continue
+
+                item_meta: dict = {
+                    "path": str(saved_path),
+                    "type": media_type,
+                }
+
+                if media_type == "video" and m.document:
+                    for attr in m.document.attributes or []:
+                        if isinstance(attr, DocumentAttributeVideo):
+                            if getattr(attr, "w", None):
+                                item_meta["width"] = int(attr.w)
+                            if getattr(attr, "h", None):
+                                item_meta["height"] = int(attr.h)
+                            if getattr(attr, "duration", None) is not None:
+                                item_meta["duration"] = int(round(float(attr.duration)))
+                            break
+
+                    if getattr(m.document, "thumbs", None):
+                        thumb_target = MEDIA_DIR / f"src_{abs(chat_id)}_{m.id}_thumb.jpg"
+                        try:
+                            saved_thumb = await self.client.download_media(
+                                m, thumb=-1, file=str(thumb_target)
+                            )
+                            if saved_thumb and Path(saved_thumb).exists():
+                                item_meta["thumb_path"] = str(saved_thumb)
+                        except Exception:
+                            pass
+
+                downloaded.append(item_meta)
             except Exception as exc:
                 logger.warning("Не удалось скачать медиа поста %s: %s", m.id, exc)
 

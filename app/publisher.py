@@ -73,6 +73,21 @@ class Publisher:
         self.config = config
         self.db = db
 
+    @staticmethod
+    def _video_kwargs(item: dict[str, Any]) -> dict[str, Any]:
+        """Параметры для нативного потокового воспроизведения видео в Telegram без скачивания."""
+        kwargs: dict[str, Any] = {"supports_streaming": True}
+        if item.get("width"):
+            kwargs["width"] = int(item["width"])
+        if item.get("height"):
+            kwargs["height"] = int(item["height"])
+        if item.get("duration") is not None:
+            kwargs["duration"] = int(item["duration"])
+        thumb = item.get("thumb_path")
+        if thumb and Path(thumb).exists():
+            kwargs["thumbnail"] = FSInputFile(thumb)
+        return kwargs
+
     async def send_to_moderation(
         self, post_id: int, target_admin_id: int | None = None
     ) -> None:
@@ -116,6 +131,7 @@ class Publisher:
                             caption=full_preview_text,
                             parse_mode="HTML",
                             reply_markup=keyboard,
+                            **self._video_kwargs(item),
                         )
                     else:
                         await self.bot.send_photo(
@@ -190,6 +206,7 @@ class Publisher:
                             video=file,
                             caption=text or None,
                             parse_mode="HTML",
+                            **self._video_kwargs(item),
                         )
                     else:
                         await self.bot.send_photo(
@@ -201,7 +218,11 @@ class Publisher:
                 else:
                     # Если текст длиннее 1024 символов — отправляем медиа и следом текст
                     if item["type"] == "video":
-                        await self.bot.send_video(chat_id=target, video=file)
+                        await self.bot.send_video(
+                            chat_id=target,
+                            video=file,
+                            **self._video_kwargs(item),
+                        )
                     else:
                         await self.bot.send_photo(chat_id=target, photo=file)
                     await self.bot.send_message(
@@ -232,9 +253,9 @@ class Publisher:
             logger.exception("Ошибка публикации поста #%s в канал: %s", post_id, exc)
             return False
 
-    @staticmethod
+    @classmethod
     def _build_media_group(
-        media_items: list[dict[str, str]], caption: str | None = None
+        cls, media_items: list[dict[str, Any]], caption: str | None = None
     ) -> list[InputMediaPhoto | InputMediaVideo]:
         group: list[InputMediaPhoto | InputMediaVideo] = []
         for idx, item in enumerate(media_items[:10]):
@@ -244,7 +265,10 @@ class Publisher:
             if item["type"] == "video":
                 group.append(
                     InputMediaVideo(
-                        media=file, caption=item_caption, parse_mode=parse_mode
+                        media=file,
+                        caption=item_caption,
+                        parse_mode=parse_mode,
+                        **cls._video_kwargs(item),
                     )
                 )
             else:
@@ -259,12 +283,13 @@ class Publisher:
     def cleanup_post_media(post: dict[str, Any]) -> None:
         """Удаляет временные скачанные медиафайлы после публикации или отклонения."""
         for item in post.get("media_items", []):
-            path = item.get("path")
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            for key in ("path", "thumb_path"):
+                path = item.get(key)
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
     @staticmethod
     def cleanup_stale_media_dir(media_dir: Path, max_age_hours: int = 72) -> int:

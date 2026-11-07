@@ -81,8 +81,17 @@ class AIService:
             else ""
         )
 
+        tech_rules = (
+            "Обязательные технические правила ссылок и разметки:\n"
+            "- ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на обсуждаемые сервисы, сайты, "
+            'GitHub, инструменты, статьи, видео и т.д.), встраивая их через HTML-тег <a href="https://...">текст</a>.\n'
+            "- УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n"
+            "- Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <blockquote>, <a href=\"...\"> (без Markdown)."
+        )
+
         system_prompt = (
             f"{style_prompt}\n\n"
+            f"{tech_rules}\n\n"
             f"{length_rule}\n"
             f"{ad_rule}\n"
             f"{recent_context}"
@@ -91,7 +100,7 @@ class AIService:
             "{\n"
             '  "is_rejected": false,\n'
             '  "reject_reason": "",\n'
-            '  "rewritten_text": "Готовый переписанный текст с HTML-тегами <b>, <i>"\n'
+            '  "rewritten_text": "Готовый переписанный текст с HTML-тегами <b>, <i>, <a href=...>"\n'
             "}"
         )
 
@@ -317,10 +326,27 @@ class AIService:
 
     @staticmethod
     def _sanitize_html_and_links(text: str) -> str:
-        text = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", text)
-        text = re.sub(r"\b(?:t\.me|telegram\.me)/\S+", "", text)
-        text = re.sub(r"(?<!\w)@[a-zA-Z0-9_]{3,32}\b", "", text)
+        # 1. Если ИИ случайно написал ссылку в Markdown [текст](https://...), конвертируем в HTML <a>
+        text = re.sub(
+            r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+            r'<a href="\2">\1</a>',
+            text,
+        )
 
+        # 2. Аккуратно убираем HTML-ссылки, ведущие на чужие t.me / telegram.me каналы
+        text = re.sub(
+            r'<a\s+href=["\'](?:https?://)?(?:t\.me|telegram\.me)/[^"\']*["\']\s*>.*?</a>',
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        # 3. Убираем голые ссылки t.me/... и чужие @юзернеймы (но НЕ трогаем email вида user@mail.com)
+        text = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:t\.me|telegram\.me)/\S+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"(?<![a-zA-Z0-9._%+-])@[a-zA-Z0-9_]{3,32}\b", "", text)
+
+        # 4. Конвертируем частые теги от нейросетей в поддерживаемые Telegram
         text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*/\s*p\s*>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*p(?:\s+[^>]*)?\s*>", "", text, flags=re.IGNORECASE)
@@ -328,14 +354,19 @@ class AIService:
 
         allowed_pattern = re.compile(
             r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)\b[^>]*>"
-            r"|<a\s+href=[\"'][^\"']+[\"']\s*>|</a>",
+            r"|<a\s+href=[\"']https?://[^\"']+[\"'][^>]*>|</a>",
             flags=re.IGNORECASE,
         )
         preserved: list[str] = []
 
         def _stash(match: re.Match) -> str:
+            tag_str = match.group(0)
+            # Нормализуем <a href="..." target="_blank"> -> <a href="..."> для строгого парсера Telegram
+            a_match = re.match(r'<a\s+href=(["\']https?://[^"\']+["\'])[^>]*>', tag_str, flags=re.IGNORECASE)
+            if a_match:
+                tag_str = f"<a href={a_match.group(1)}>"
             idx = len(preserved)
-            preserved.append(match.group(0))
+            preserved.append(tag_str)
             return f"\x00TAG{idx}\x00"
 
         stashed = allowed_pattern.sub(_stash, text)

@@ -63,6 +63,15 @@ class Database:
                     (k, v),
                 )
 
+            # Обновляем старый дефолтный промпт, чтобы сохранялись полезные внешние ссылки
+            await db.execute(
+                """
+                UPDATE settings SET value = ?
+                WHERE key = 'style_prompt' AND value LIKE '%ПОЛНОСТЬЮ удали любые чужие @юзернеймы%'
+                """,
+                (DEFAULT_STYLE_PROMPT,),
+            )
+
             # Автовосстановление списка каналов из INITIAL_SOURCES_JSON (для бесплатного облака без диска)
             initial_sources_raw = os.getenv("INITIAL_SOURCES_JSON", "").strip()
             if initial_sources_raw:
