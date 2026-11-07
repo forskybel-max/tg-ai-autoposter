@@ -144,6 +144,15 @@ async def main() -> None:
         except Exception:
             pass
 
+    async def _startup_ai_probe() -> None:
+        try:
+            res = await ai_service.process_post("Сегодня вышла важная новость в мире технологий.")
+            logger.info("STARTUP_AI_OK (model=%s): %s", config.ai_model, res.rewritten_text[:120])
+        except Exception as exc:
+            logger.error("STARTUP_AI_FAIL: %s", exc)
+
+    asyncio.create_task(_startup_ai_probe())
+
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

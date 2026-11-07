@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import re
+import time
 import urllib.request
 from dataclasses import dataclass
-import httpx
+import aiohttp
 
 from app.config import Config
 from app.database import Database
@@ -24,6 +26,7 @@ class AIService:
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
+        self._discovered_gemini_fallbacks: list[str] | None = None
 
     async def process_post(
         self,
@@ -112,7 +115,6 @@ class AIService:
         )
 
     def _resolve_proxy(self) -> str | None:
-        """Возвращает прокси из .env или системный прокси Windows (если включен)."""
         if self.config.ai_proxy:
             return self.config.ai_proxy
         sys_proxies = urllib.request.getproxies()
@@ -121,63 +123,120 @@ class AIService:
             proxy = f"http://{proxy}"
         return proxy
 
-    def _build_http_client(self) -> httpx.AsyncClient:
-        proxy = self._resolve_proxy()
-        timeout = httpx.Timeout(connect=15.0, read=60.0, write=20.0, pool=15.0)
-        if proxy:
-            return httpx.AsyncClient(timeout=timeout, proxy=proxy, http2=False)
-        return httpx.AsyncClient(timeout=timeout, http2=False)
+    async def _discover_gemini_models(self, session: aiohttp.ClientSession, proxy: str | None) -> list[str]:
+        if self._discovered_gemini_fallbacks is not None:
+            return self._discovered_gemini_fallbacks
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.config.ai_api_key}"
+        try:
+            async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                data = await resp.json()
+                models_raw = data.get("models") or []
+                candidates: list[str] = []
+                for m in models_raw:
+                    methods = m.get("supportedGenerationMethods") or []
+                    name = m.get("name", "").removeprefix("models/")
+                    if "generateContent" in methods and "tts" not in name and "image" not in name and "embedding" not in name:
+                        if "flash" in name:
+                            candidates.append(name)
+                logger.info("Доступные модели Gemini Flash на ключе: %s", candidates)
+                # Приоритет быстрым flash-lite / flash моделям
+                candidates.sort(key=lambda x: (0 if "lite" in x else 1, x))
+                self._discovered_gemini_fallbacks = candidates
+                return candidates
+        except Exception as exc:
+            logger.warning("Не удалось получить список моделей Gemini: %s", exc)
+            return []
 
     async def _call_llm(self, system_prompt: str, user_text: str) -> str:
         if self.config.ai_provider == "gemini" and "googleapis.com" in self.config.ai_base_url:
             return await self._call_gemini_native(system_prompt, user_text)
         return await self._call_openai_compatible(system_prompt, user_text)
 
-    async def _call_gemini_native(self, system_prompt: str, user_text: str) -> str:
-        """Потоковый вызов нативного REST API Google Gemini (не зависает на VPN при генерации)."""
-        model = self.config.ai_model.removeprefix("models/")
+    async def _call_gemini_single(
+        self,
+        session: aiohttp.ClientSession,
+        model: str,
+        system_prompt: str,
+        user_text: str,
+        proxy: str | None,
+        use_low_thinking: bool = True,
+        timeout_sec: float = 35.0,
+    ) -> str:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:streamGenerateContent?alt=sse&key={self.config.ai_api_key}"
+            f"{model}:generateContent?key={self.config.ai_api_key}"
         )
+        gen_cfg: dict = {"temperature": 0.6}
+        if use_low_thinking and ("3.8" in model or "3.7" in model):
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
+
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig": {
-                "temperature": 0.6,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": gen_cfg,
         }
 
-        collected_chunks: list[str] = []
-        async with self._build_http_client() as client:
-            async with client.stream("POST", url, json=payload) as response:
-                if response.status_code != 200:
-                    err_bytes = await response.aread()
-                    body_preview = err_bytes.decode("utf-8", errors="replace")[:400]
-                    logger.error("Ошибка ответа Gemini (%s): %s", response.status_code, body_preview)
-                    raise RuntimeError(f"Gemini HTTP {response.status_code}: {body_preview}")
+        t0 = time.monotonic()
+        async with session.post(
+            url,
+            json=payload,
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=timeout_sec, connect=10.0),
+        ) as resp:
+            body_text = await resp.text()
+            elapsed = time.monotonic() - t0
+            if resp.status != 200:
+                raise RuntimeError(f"Gemini ({model}) HTTP {resp.status} [{elapsed:.1f}s]: {body_text[:350]}")
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    raw_json = line[5:].strip()
-                    if not raw_json or raw_json == "[DONE]":
-                        continue
+            data = json.loads(body_text)
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise RuntimeError(f"Пустой ответ от Gemini ({model}): {body_text[:250]}")
+            parts = candidates[0].get("content", {}).get("parts") or []
+            texts = [p["text"] for p in parts if "text" in p and not p.get("thought", False)]
+            if not texts:
+                texts = [p["text"] for p in parts if "text" in p]
+            logger.info("Gemini (%s) ответил за %.2f сек", model, elapsed)
+            return "\n".join(texts).strip()
+
+    async def _call_gemini_native(self, system_prompt: str, user_text: str) -> str:
+        """Вызов нативного REST API Google Gemini с автоподбором быстрой модели при таймауте."""
+        proxy = self._resolve_proxy()
+        primary_model = self.config.ai_model.removeprefix("models/")
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                return await self._call_gemini_single(
+                    session, primary_model, system_prompt, user_text, proxy, use_low_thinking=True, timeout_sec=25.0
+                )
+            except (asyncio.TimeoutError, Exception) as first_err:
+                logger.warning("Первичная модель %s не ответила быстро (%s: %s), ищем резервную Flash-модель...", primary_model, type(first_err).__name__, first_err)
+                # Если ошибка 400 из-за thinkingConfig — пробуем ту же модель без thinkingConfig
+                if "thinking" in str(first_err).lower():
                     try:
-                        chunk_data = json.loads(raw_json)
-                        for cand in chunk_data.get("candidates") or []:
-                            for part in cand.get("content", {}).get("parts") or []:
-                                if "text" in part and not part.get("thought", False):
-                                    collected_chunks.append(part["text"])
+                        return await self._call_gemini_single(
+                            session, primary_model, system_prompt, user_text, proxy, use_low_thinking=False, timeout_sec=30.0
+                        )
                     except Exception:
                         pass
 
-        result = "".join(collected_chunks).strip()
-        if not result:
-            raise RuntimeError("Пустой ответ от Gemini API")
-        return result
+                fallbacks = await self._discover_gemini_models(session, proxy)
+                last_err: Exception = first_err
+                for fb_model in fallbacks:
+                    if fb_model == primary_model:
+                        continue
+                    try:
+                        res = await self._call_gemini_single(
+                            session, fb_model, system_prompt, user_text, proxy, use_low_thinking=True, timeout_sec=25.0
+                        )
+                        logger.info("Переключаем рабочую модель по умолчанию на быструю: %s", fb_model)
+                        self.config.ai_model = fb_model
+                        return res
+                    except Exception as fb_err:
+                        logger.warning("Резервная модель %s не сработала: %s: %s", fb_model, type(fb_err).__name__, fb_err)
+                        last_err = fb_err
+
+                raise RuntimeError(f"{type(last_err).__name__}: {last_err}") from last_err
 
     async def _call_openai_compatible(self, system_prompt: str, user_text: str) -> str:
         url = f"{self.config.ai_base_url}/chat/completions"
@@ -185,6 +244,7 @@ class AIService:
             "Authorization": f"Bearer {self.config.ai_api_key}",
             "Content-Type": "application/json",
         }
+        proxy = self._resolve_proxy()
 
         models_to_try = [self.config.ai_model]
         if self.config.ai_provider == "openrouter" and (
@@ -201,7 +261,7 @@ class AIService:
                     models_to_try.append(fb)
 
         last_err = ""
-        async with self._build_http_client() as client:
+        async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
                 payload = {
                     "model": model_name,
@@ -211,16 +271,23 @@ class AIService:
                     ],
                     "temperature": 0.6,
                 }
-                response = await client.post(url, headers=headers, json=payload)
-                if response.status_code == 200:
-                    data = response.json()
-                    choices = data.get("choices") or []
-                    if choices and choices[0].get("message", {}).get("content"):
-                        return choices[0]["message"]["content"].strip()
-                last_err = f"HTTP {response.status_code} ({model_name}): {response.text[:350]}"
-                logger.warning("Попытка модели %s не удалась: %s", model_name, last_err)
-                if response.status_code in (401, 403):
-                    break
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=40.0, connect=12.0),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        data = json.loads(body)
+                        choices = data.get("choices") or []
+                        if choices and choices[0].get("message", {}).get("content"):
+                            return choices[0]["message"]["content"].strip()
+                    last_err = f"HTTP {resp.status} ({model_name}): {body[:350]}"
+                    logger.warning("Попытка модели %s не удалась: %s", model_name, last_err)
+                    if resp.status in (401, 403):
+                        break
 
         raise RuntimeError(last_err)
 
@@ -250,23 +317,15 @@ class AIService:
 
     @staticmethod
     def _sanitize_html_and_links(text: str) -> str:
-        """
-        Страховочная зачистка после ИИ:
-        1. Удаляет забытые @username и ссылки на чужие t.me/...
-        2. Конвертирует <br>, <p>, **жирный** в поддерживаемый Telegram HTML.
-        3. Экранирует неподдерживаемые теги и одиночные символы < и &, чтобы Telegram не выдал ошибку парсинга.
-        """
         text = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", text)
         text = re.sub(r"\b(?:t\.me|telegram\.me)/\S+", "", text)
         text = re.sub(r"(?<!\w)@[a-zA-Z0-9_]{3,32}\b", "", text)
 
-        # Замена частых HTML/Markdown конструкций от нейросетей
         text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*/\s*p\s*>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*p(?:\s+[^>]*)?\s*>", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
-        # Защищаем разрешенные теги Telegram временными маркерами, экранируем всё остальное и возвращаем теги
         allowed_pattern = re.compile(
             r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)\b[^>]*>"
             r"|<a\s+href=[\"'][^\"']+[\"']\s*>|</a>",
@@ -280,9 +339,7 @@ class AIService:
             return f"\x00TAG{idx}\x00"
 
         stashed = allowed_pattern.sub(_stash, text)
-        # Удаляем прочие случайные HTML-теги (<h1>, <div>, <ul>, <li> и т.п.)
         stashed = re.sub(r"</?[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^>]*)?>", "", stashed)
-        # Экранируем голые &, <, >
         stashed = re.sub(r"&(?!(?:lt|gt|amp|quot|#\d+);)", "&amp;", stashed)
         stashed = stashed.replace("<", "&lt;").replace(">", "&gt;")
 
