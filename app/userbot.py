@@ -17,7 +17,20 @@ from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
     ImportChatInviteRequest,
 )
-from telethon.tl.types import ChatInviteAlready, DocumentAttributeVideo, Message
+from telethon.tl.types import (
+    ChatInviteAlready,
+    DocumentAttributeVideo,
+    Message,
+    MessageEntityPre,
+    MessageEntitySpoiler,
+)
+
+# Регистрируем поддержку <tg-spoiler> и чистого <pre> для точного переноса форматирования
+tg_html.ENTITY_TO_FORMATTER[MessageEntitySpoiler] = ("<tg-spoiler>", "</tg-spoiler>")
+tg_html.ENTITY_TO_FORMATTER[MessageEntityPre] = lambda e, _: (
+    f'<pre><code class="language-{e.language}">' if getattr(e, "language", "") else "<pre>",
+    "</code></pre>" if getattr(e, "language", "") else "</pre>",
+)
 
 from app.ai_service import AIService
 from app.config import Config, MEDIA_DIR
@@ -346,11 +359,8 @@ class UserbotParser:
         original_text = ""
         for m in messages:
             if m.message and m.message.strip():
-                # Извлекаем текст вместе со скрытыми гиперссылками (<a href="...">), чтобы не терять ссылки на сервисы
-                if m.entities:
-                    original_text = tg_html.unparse(m.message, m.entities).strip()
-                else:
-                    original_text = m.message.strip()
+                # Извлекаем текст вместе с HTML-оформлением (цитаты, жирный, код, скрытые гиперссылки)
+                original_text = tg_html.unparse(m.message, m.entities or []).strip()
                 break
 
         source = await self.db.get_source(chat_id)

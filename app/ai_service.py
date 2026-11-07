@@ -7,7 +7,7 @@ import urllib.request
 from dataclasses import dataclass
 import aiohttp
 
-from app.config import Config
+from app.config import Config, FREEBIE_BADGE
 from app.database import Database
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ class AIResult:
     is_rejected: bool
     reject_reason: str
     rewritten_text: str
+    is_freebie: bool = False
 
 
 class AIService:
@@ -60,10 +61,13 @@ class AIService:
             )
 
         ad_rule = (
-            "Если исходный пост является прямой рекламой, продажей курсов, казино, ставками, "
-            "розыгрышем за подписку, призывом перейти в другой бот/канал без полезной сути, "
+            "Если исходный пост является платной рекламой чужого канала/курса, казино, ставками, "
+            "розыгрышем за подписку на спонсоров, призывом перейти в чужой ТГ-бот/канал без полезной сути, "
             "или полным смысловым дублем уже вышедшего поста из списка выше — верни "
-            '"is_rejected": true и укажи краткую причину в "reject_reason".'
+            '"is_rejected": true и укажи краткую причину в "reject_reason".\n'
+            "ВАЖНО: полезные бесплатные раздачи (игры в Steam/Epic Games, бесплатные ИИ-сервисы, промокоды на 100% скидку, "
+            "бесплатные инструменты/курсы/ассеты без подписки на ТГ-спонсоров) — это НЕ рекламный спам! Для них ставь "
+            '"is_rejected": false и "is_freebie": true!'
             if filter_ads
             else 'Всегда возвращай "is_rejected": false (фильтр рекламы отключен).'
         )
@@ -82,11 +86,20 @@ class AIService:
         )
 
         tech_rules = (
-            "Обязательные технические правила ссылок и разметки:\n"
-            "- ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на обсуждаемые сервисы, сайты, "
-            'GitHub, инструменты, статьи, видео и т.д.), встраивая их через HTML-тег <a href="https://...">текст</a>.\n'
-            "- УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n"
-            "- Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <blockquote>, <a href=\"...\"> (без Markdown)."
+            "Обязательные правила бережной редактуры, оформления и рубрик:\n"
+            "1. НЕ переписывай сильно там, где исходный текст уже написан коротко и по делу! Делай только лёгкий, естественный рерайт "
+            "без отсебятины, без «воды» и без пафосных клише.\n"
+            "2. СОХРАНЯЙ оригинальное форматирование и визуальную структуру: если в исходнике есть цитаты "
+            "(<blockquote>...</blockquote> или <blockquote expandable>...</blockquote>), списки, код (<code>, <pre>), "
+            "спойлеры (<tg-spoiler>) или жирные акценты — обязательно перенеси эти же теги в итоговый текст!\n"
+            "3. ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
+            'через HTML-тег <a href="https://...">текст</a>.\n'
+            "4. УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n"
+            "5. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
+            "к крутому платному инструменту/ИИ, промокод на бесплатную подписку, 100% скидка и т.п.) — поставь в JSON поле "
+            '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит единую плашку автоматически!\n'
+            "6. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
+            "<tg-spoiler>, <a href=\"...\"> (никакого Markdown **текст** или > цитата)."
         )
 
         system_prompt = (
@@ -100,13 +113,14 @@ class AIService:
             "{\n"
             '  "is_rejected": false,\n'
             '  "reject_reason": "",\n'
-            '  "rewritten_text": "Готовый переписанный текст с HTML-тегами <b>, <i>, <a href=...>"\n'
+            '  "is_freebie": false,\n'
+            '  "rewritten_text": "Бережно отредактированный текст с сохранением <blockquote>, <b>, <a href=...>"\n'
             "}"
         )
 
         raw_response = await self._call_llm(
             system_prompt=system_prompt,
-            user_text=f"Исходный текст поста:\n\n{original_text}",
+            user_text=f"Исходный текст поста (с HTML-разметкой оригинала):\n\n{original_text}",
         )
 
         parsed = self._parse_json_response(raw_response, fallback_text=original_text)
@@ -114,6 +128,9 @@ class AIService:
             return parsed
 
         cleaned_text = self._sanitize_html_and_links(parsed.rewritten_text)
+        if parsed.is_freebie or self.has_freebie_tag(cleaned_text):
+            cleaned_text = self.set_freebie_tag(cleaned_text, enabled=True)
+
         if signature and signature.strip():
             cleaned_text = f"{cleaned_text}\n\n{signature.strip()}".strip()
 
@@ -121,6 +138,7 @@ class AIService:
             is_rejected=False,
             reject_reason="",
             rewritten_text=cleaned_text,
+            is_freebie=parsed.is_freebie or self.has_freebie_tag(cleaned_text),
         )
 
     def _resolve_proxy(self) -> str | None:
@@ -175,7 +193,7 @@ class AIService:
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={self.config.ai_api_key}"
         )
-        gen_cfg: dict = {"temperature": 0.6}
+        gen_cfg: dict = {"temperature": 0.3}
         if use_low_thinking and ("3.8" in model or "3.7" in model):
             gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
 
@@ -278,7 +296,7 @@ class AIService:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_text},
                     ],
-                    "temperature": 0.6,
+                    "temperature": 0.3,
                 }
                 async with session.post(
                     url,
@@ -315,6 +333,7 @@ class AIService:
                 is_rejected=bool(obj.get("is_rejected", False)),
                 reject_reason=str(obj.get("reject_reason", "")),
                 rewritten_text=str(obj.get("rewritten_text", "")).strip(),
+                is_freebie=bool(obj.get("is_freebie", False)),
             )
         except Exception:
             logger.warning("Не удалось распарсить JSON от ИИ, используем текст напрямую")
@@ -322,7 +341,32 @@ class AIService:
                 is_rejected=False,
                 reject_reason="",
                 rewritten_text=cleaned or fallback_text,
+                is_freebie=False,
             )
+
+    @staticmethod
+    def has_freebie_tag(text: str) -> bool:
+        return bool(re.search(r"#халява\b", text, flags=re.IGNORECASE))
+
+    @staticmethod
+    def set_freebie_tag(text: str, enabled: bool) -> str:
+        # Убираем существующую плашку #халява в начале или отдельной строкой, чтобы не было дублей
+        cleaned = re.sub(
+            r"^\s*(?:🎁\s*)?(?:<(?:b|strong)>)?#халява(?:</(?:b|strong)>)?\s*\n*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not enabled:
+            cleaned = re.sub(
+                r"(?:🎁\s*)?(?:<(?:b|strong)>)?#халява\b(?:</(?:b|strong)>)?",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+            return cleaned
+        return f"{FREEBIE_BADGE}\n\n{cleaned.strip()}".strip()
 
     @staticmethod
     def _sanitize_html_and_links(text: str) -> str:
@@ -346,11 +390,19 @@ class AIService:
         text = re.sub(r"\b(?:t\.me|telegram\.me)/\S+", "", text, flags=re.IGNORECASE)
         text = re.sub(r"(?<![a-zA-Z0-9._%+-])@[a-zA-Z0-9_]{3,32}\b", "", text)
 
-        # 4. Конвертируем частые теги от нейросетей в поддерживаемые Telegram
+        # 4. Конвертируем частые теги и Markdown-цитаты (> текст) в поддерживаемые Telegram HTML
         text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*/\s*p\s*>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*p(?:\s+[^>]*)?\s*>", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        # Если ИИ написал цитату через Markdown '> строка', оборачиваем в <blockquote>
+        text = re.sub(
+            r"(?:^|\n)((?:>\s?.+(?:\n|$))+)",
+            lambda m: "\n<blockquote>"
+            + "\n".join(re.sub(r"^>\s?", "", line) for line in m.group(1).strip().splitlines())
+            + "</blockquote>\n",
+            text,
+        )
 
         allowed_pattern = re.compile(
             r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)\b[^>]*>"
@@ -361,10 +413,15 @@ class AIService:
 
         def _stash(match: re.Match) -> str:
             tag_str = match.group(0)
-            # Нормализуем <a href="..." target="_blank"> -> <a href="..."> для строгого парсера Telegram
             a_match = re.match(r'<a\s+href=(["\']https?://[^"\']+["\'])[^>]*>', tag_str, flags=re.IGNORECASE)
             if a_match:
                 tag_str = f"<a href={a_match.group(1)}>"
+            elif re.match(r"<blockquote\b", tag_str, flags=re.IGNORECASE):
+                tag_str = (
+                    "<blockquote expandable>"
+                    if "expandable" in tag_str.lower()
+                    else "<blockquote>"
+                )
             idx = len(preserved)
             preserved.append(tag_str)
             return f"\x00TAG{idx}\x00"

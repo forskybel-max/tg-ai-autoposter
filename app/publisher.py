@@ -14,6 +14,7 @@ from aiogram.types import (
     InputMediaVideo,
 )
 
+from app.ai_service import AIService
 from app.config import Config
 from app.database import Database
 
@@ -21,9 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 def build_moderation_keyboard(
-    post_id: int, has_media: bool, use_media: bool
+    post_id: int,
+    has_media: bool,
+    use_media: bool,
+    is_freebie: bool = False,
 ) -> InlineKeyboardMarkup:
     """Формирует инлайн-клавиатуру для поста в предложке."""
+    freebie_label = "🎁 Халява: ВКЛ" if is_freebie else "🎁 + #халява"
     rows = [
         [
             InlineKeyboardButton(
@@ -41,29 +46,34 @@ def build_moderation_keyboard(
                 callback_data=f"pub:edit:{post_id}",
             ),
         ],
+        [
+            InlineKeyboardButton(
+                text=freebie_label,
+                callback_data=f"pub:freebie:{post_id}",
+            ),
+            InlineKeyboardButton(
+                text="👁 Исходник",
+                callback_data=f"pub:orig:{post_id}",
+            ),
+        ],
     ]
 
-    extra_row = [
-        InlineKeyboardButton(
-            text="👁 Исходник",
-            callback_data=f"pub:orig:{post_id}",
-        )
-    ]
+    bottom_row: list[InlineKeyboardButton] = []
     if has_media:
         media_label = "🖼 Убрать медиа" if use_media else "🖼 Вернуть медиа"
-        extra_row.append(
+        bottom_row.append(
             InlineKeyboardButton(
                 text=media_label,
                 callback_data=f"pub:toggle_media:{post_id}",
             )
         )
-    extra_row.append(
+    bottom_row.append(
         InlineKeyboardButton(
             text="❌ Отклонить",
             callback_data=f"pub:reject:{post_id}",
         )
     )
-    rows.append(extra_row)
+    rows.append(bottom_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -88,6 +98,26 @@ class Publisher:
             kwargs["thumbnail"] = FSInputFile(thumb)
         return kwargs
 
+    @staticmethod
+    def build_preview_text(
+        post: dict[str, Any],
+        media_count: int,
+        has_media: bool,
+        use_media: bool,
+    ) -> str:
+        """Формирует текст превью поста в предложке вместе со служебной шапкой."""
+        media_badge = (
+            f"📎 Медиа: {media_count} шт. ({'вкл' if use_media else 'выкл — только текст'})"
+            if has_media
+            else "📎 Без медиа"
+        )
+        header = (
+            f"📥 <b>Предложка #{post['id']}</b> | Источник: <b>{html.escape(post['source_title'])}</b>\n"
+            f"<i>{media_badge}</i>\n"
+            f"{'─' * 22}\n\n"
+        )
+        return f"{header}{post['rewritten_text']}"
+
     async def send_to_moderation(
         self, post_id: int, target_admin_id: int | None = None
     ) -> None:
@@ -101,19 +131,13 @@ class Publisher:
         ]
         has_media = len(media_items) > 0
         use_media = bool(post["use_media"]) and has_media
-        keyboard = build_moderation_keyboard(post_id, has_media, use_media)
-
-        media_badge = (
-            f"📎 Медиа: {len(media_items)} шт. ({'вкл' if use_media else 'выкл — только текст'})"
-            if has_media
-            else "📎 Без медиа"
+        is_freebie = AIService.has_freebie_tag(post["rewritten_text"])
+        keyboard = build_moderation_keyboard(
+            post_id, has_media, use_media, is_freebie=is_freebie
         )
-        header = (
-            f"📥 <b>Предложка #{post_id}</b> | Источник: <b>{html.escape(post['source_title'])}</b>\n"
-            f"<i>{media_badge}</i>\n"
-            f"{'─' * 22}\n\n"
+        full_preview_text = self.build_preview_text(
+            post, len(media_items), has_media, use_media
         )
-        full_preview_text = f"{header}{post['rewritten_text']}"
 
         recipients = (
             [target_admin_id] if target_admin_id else self.config.admin_ids

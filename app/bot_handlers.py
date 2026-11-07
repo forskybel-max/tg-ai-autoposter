@@ -1,5 +1,7 @@
 import html
 import logging
+import re
+from pathlib import Path
 
 from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command
@@ -666,13 +668,74 @@ def setup_router(
             await call.answer("Пост не найден", show_alert=True)
             return
         orig = post["original_text"] or "(Пост был без текста)"
-        await call.message.reply(
-            f"👁 <b>Исходный текст из «{html.escape(post['source_title'])}»:</b>\n\n"
-            f"{html.escape(orig[:3800])}",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        title_esc = html.escape(post["source_title"])
+        try:
+            cleaned_orig = re.sub(r"</?tg-emoji[^>]*>", "", orig)
+            await call.message.reply(
+                f"👁 <b>Исходный пост из «{title_esc}»:</b>\n\n{cleaned_orig[:3800]}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await call.message.reply(
+                f"👁 <b>Исходный пост из «{title_esc}»:</b>\n\n{html.escape(orig[:3800])}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
         await call.answer()
+
+    @router.callback_query(F.data.startswith("pub:freebie:"))
+    async def cb_toggle_freebie(call: CallbackQuery) -> None:
+        post_id = int(call.data.split(":")[2])
+        post = await db.get_post(post_id)
+        if not post:
+            await call.answer("Пост не найден", show_alert=True)
+            return
+
+        currently_freebie = AIService.has_freebie_tag(post["rewritten_text"])
+        new_freebie = not currently_freebie
+        new_text = AIService.set_freebie_tag(post["rewritten_text"], enabled=new_freebie)
+        await db.update_post_text(post_id, new_text)
+        post["rewritten_text"] = new_text
+
+        media_items = [m for m in post["media_items"] if Path(m["path"]).exists()]
+        has_media = len(media_items) > 0
+        use_media = bool(post["use_media"]) and has_media
+        new_kb = build_moderation_keyboard(
+            post_id, has_media, use_media, is_freebie=new_freebie
+        )
+        preview_text = publisher.build_preview_text(
+            post, len(media_items), has_media, use_media
+        )
+
+        try:
+            if call.message.caption is not None and len(preview_text) <= 1024:
+                await call.message.edit_caption(
+                    caption=preview_text,
+                    parse_mode="HTML",
+                    reply_markup=new_kb,
+                )
+            elif call.message.text is not None:
+                await call.message.edit_text(
+                    text=preview_text[:4090],
+                    parse_mode="HTML",
+                    reply_markup=new_kb,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await call.message.edit_reply_markup(reply_markup=new_kb)
+        except Exception as exc:
+            logger.warning("Не удалось обновить превью поста #%s: %s", post_id, exc)
+            try:
+                await call.message.edit_reply_markup(reply_markup=new_kb)
+            except Exception:
+                pass
+
+        await call.answer(
+            "🎁 Рубрика #халява добавлена!"
+            if new_freebie
+            else "Метка #халява убрана"
+        )
 
     @router.callback_query(F.data.startswith("pub:toggle_media:"))
     async def cb_toggle_media(call: CallbackQuery) -> None:
@@ -681,8 +744,12 @@ def setup_router(
         post = await db.get_post(post_id)
         if not post:
             return
-        has_media = len(post["media_items"]) > 0
-        new_kb = build_moderation_keyboard(post_id, has_media, use_media)
+        media_items = [m for m in post["media_items"] if Path(m["path"]).exists()]
+        has_media = len(media_items) > 0
+        is_freebie = AIService.has_freebie_tag(post["rewritten_text"])
+        new_kb = build_moderation_keyboard(
+            post_id, has_media, use_media and has_media, is_freebie=is_freebie
+        )
         await call.message.edit_reply_markup(reply_markup=new_kb)
         await call.answer(
             "Медиа включено для публикации"
@@ -732,7 +799,7 @@ def setup_router(
         ai_res = await ai.process_post(
             original_text=post["original_text"],
             has_media=bool(post["use_media"] and post["media_items"]),
-            extra_instruction="Предложи совершенно другую подачу и более цепляющий заголовок.",
+            extra_instruction="Сформулируй другими словами без лишней воды, сохранив оригинальное оформление, цитаты и ссылки.",
         )
         if ai_res.rewritten_text:
             await db.update_post_text(post_id, ai_res.rewritten_text)

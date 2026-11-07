@@ -63,14 +63,14 @@ class Database:
                     (k, v),
                 )
 
-            # Обновляем старый дефолтный промпт, чтобы сохранялись полезные внешние ссылки
-            await db.execute(
-                """
-                UPDATE settings SET value = ?
-                WHERE key = 'style_prompt' AND value LIKE '%ПОЛНОСТЬЮ удали любые чужие @юзернеймы%'
-                """,
-                (DEFAULT_STYLE_PROMPT,),
-            )
+            # Обновляем старый дефолтный промпт на бережную редактуру с сохранением цитат и ссылок
+            async with db.execute("SELECT value FROM settings WHERE key = 'style_prompt'") as cur:
+                row = await cur.fetchone()
+                if row and "опытный главный редактор" in row[0]:
+                    await db.execute(
+                        "UPDATE settings SET value = ? WHERE key = 'style_prompt'",
+                        (DEFAULT_STYLE_PROMPT,),
+                    )
 
             # Автовосстановление списка каналов из INITIAL_SOURCES_JSON (для бесплатного облака без диска)
             initial_sources_raw = os.getenv("INITIAL_SOURCES_JSON", "").strip()
