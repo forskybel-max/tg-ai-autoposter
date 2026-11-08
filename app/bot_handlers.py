@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 import re
 from pathlib import Path
@@ -438,14 +439,38 @@ def setup_router(
         rows.append(
             [
                 InlineKeyboardButton(text="➕ Добавить ещё", callback_data="menu:add_src"),
-                InlineKeyboardButton(text="🔙 В меню", callback_data="menu:home"),
+                InlineKeyboardButton(text="📤 Экспорт (JSON)", callback_data="src:export"),
             ]
         )
+        rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="menu:home")])
         await call.message.edit_text(
             "📋 <b>Ваши каналы-доноры:</b>\n"
             "Нажмите на канал, чтобы протестировать парсинг последнего поста, поставить на паузу или удалить.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "src:export")
+    async def cb_export_sources(call: CallbackQuery) -> None:
+        sources = await db.get_sources()
+        payload = [
+            {
+                "chat_id": int(s["chat_id"]),
+                "title": s["title"],
+                "username_or_link": s["username_or_link"],
+                "is_private": int(s["is_private"]),
+                "enabled": int(s["enabled"]),
+            }
+            for s in sources
+        ]
+        dumped = json.dumps(payload, ensure_ascii=False)
+        await call.message.answer(
+            "📤 <b>Текущий список каналов для <code>INITIAL_SOURCES_JSON</code> на Render:</b>\n"
+            "<i>(Если добавили новый канал и хотите, чтобы он сохранялся при перезапусках бесплатного сервера Render — "
+            "обновите переменную <code>INITIAL_SOURCES_JSON</code> в панели Render или отправьте её мне):</i>\n\n"
+            f"<code>{html.escape(dumped)}</code>",
+            parse_mode="HTML",
         )
         await call.answer()
 
@@ -671,8 +696,12 @@ def setup_router(
         title_esc = html.escape(post["source_title"])
         try:
             cleaned_orig = re.sub(r"</?tg-emoji[^>]*>", "", orig)
+            safe_orig = AIService.truncate_telegram_html(
+                AIService.balance_telegram_html(cleaned_orig, strip_tg_links=False),
+                3800,
+            )
             await call.message.reply(
-                f"👁 <b>Исходный пост из «{title_esc}»:</b>\n\n{cleaned_orig[:3800]}",
+                f"👁 <b>Исходный пост из «{title_esc}»:</b>\n\n{safe_orig}",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -704,20 +733,27 @@ def setup_router(
         new_kb = build_moderation_keyboard(
             post_id, has_media, use_media, is_freebie=new_freebie
         )
-        preview_text = publisher.build_preview_text(
-            post, len(media_items), has_media, use_media
+        preview_text = AIService.balance_telegram_html(
+            publisher.build_preview_text(post, len(media_items), has_media, use_media)
         )
 
         try:
-            if call.message.caption is not None and len(preview_text) <= 1024:
-                await call.message.edit_caption(
-                    caption=preview_text,
-                    parse_mode="HTML",
-                    reply_markup=new_kb,
-                )
+            if call.message.caption is not None:
+                if len(preview_text) <= 1024:
+                    await call.message.edit_caption(
+                        caption=preview_text,
+                        parse_mode="HTML",
+                        reply_markup=new_kb,
+                    )
+                else:
+                    # Подпись с добавленным тегом превысила лимит 1024 симв. — обновляем отдельным превью
+                    await call.message.edit_reply_markup(reply_markup=new_kb)
+                    await publisher.send_to_moderation(
+                        post_id, target_admin_id=call.from_user.id
+                    )
             elif call.message.text is not None:
                 await call.message.edit_text(
-                    text=preview_text[:4090],
+                    text=AIService.truncate_telegram_html(preview_text, 4090),
                     parse_mode="HTML",
                     reply_markup=new_kb,
                     disable_web_page_preview=True,
@@ -732,7 +768,7 @@ def setup_router(
                 pass
 
         await call.answer(
-            "🎁 Рубрика #халява добавлена!"
+            "🏷 Рубрика #халява добавлена!"
             if new_freebie
             else "Метка #халява убрана"
         )
@@ -796,15 +832,22 @@ def setup_router(
             return
 
         await call.message.edit_text("⏳ Переписываю пост через ИИ...")
-        ai_res = await ai.process_post(
-            original_text=post["original_text"],
-            has_media=bool(post["use_media"] and post["media_items"]),
-            extra_instruction="Сформулируй другими словами без лишней воды, сохранив оригинальное оформление, цитаты и ссылки.",
-        )
-        if ai_res.rewritten_text:
-            await db.update_post_text(post_id, ai_res.rewritten_text)
-        await call.message.delete()
-        await publisher.send_to_moderation(post_id, target_admin_id=call.from_user.id)
+        try:
+            ai_res = await ai.process_post(
+                original_text=post["original_text"],
+                has_media=bool(post["use_media"] and post["media_items"]),
+                extra_instruction="Сформулируй другими словами без лишней воды, сохранив оригинальное оформление, цитаты и ссылки.",
+            )
+            if ai_res.rewritten_text:
+                await db.update_post_text(post_id, ai_res.rewritten_text)
+            await call.message.delete()
+            await publisher.send_to_moderation(post_id, target_admin_id=call.from_user.id)
+        except Exception as exc:
+            logger.exception("Ошибка перегенерации поста #%s: %s", post_id, exc)
+            await call.message.edit_text(
+                f"❌ Ошибка при обращении к ИИ: <code>{html.escape(str(exc)[:400])}</code>",
+                parse_mode="HTML",
+            )
 
     @router.message(AdminStates.waiting_for_rewrite_hint)
     async def msg_rewrite_with_hint(message: Message, state: FSMContext) -> None:
@@ -818,17 +861,24 @@ def setup_router(
             return
 
         wait_msg = await message.answer("⏳ Переписываю с учетом ваших пожеланий...")
-        ai_res = await ai.process_post(
-            original_text=post["original_text"],
-            has_media=bool(post["use_media"] and post["media_items"]),
-            extra_instruction=message.text.strip(),
-        )
-        if ai_res.rewritten_text:
-            await db.update_post_text(int(post_id), ai_res.rewritten_text)
-        await wait_msg.delete()
-        await publisher.send_to_moderation(
-            int(post_id), target_admin_id=message.from_user.id
-        )
+        try:
+            ai_res = await ai.process_post(
+                original_text=post["original_text"],
+                has_media=bool(post["use_media"] and post["media_items"]),
+                extra_instruction=message.text.strip(),
+            )
+            if ai_res.rewritten_text:
+                await db.update_post_text(int(post_id), ai_res.rewritten_text)
+            await wait_msg.delete()
+            await publisher.send_to_moderation(
+                int(post_id), target_admin_id=message.from_user.id
+            )
+        except Exception as exc:
+            logger.exception("Ошибка перегенерации поста #%s по подсказке: %s", post_id, exc)
+            await wait_msg.edit_text(
+                f"❌ Ошибка при обращении к ИИ: <code>{html.escape(str(exc)[:400])}</code>",
+                parse_mode="HTML",
+            )
 
     @router.callback_query(F.data.startswith("pub:edit:"))
     async def cb_manual_edit(call: CallbackQuery, state: FSMContext) -> None:
@@ -862,6 +912,7 @@ def setup_router(
         new_html = (message.html_text or message.text or "").strip()
         if not new_html:
             return
+        new_html = AIService.balance_telegram_html(new_html, strip_tg_links=False)
         await db.update_post_text(int(post_id), new_html)
         await publisher.send_to_moderation(
             int(post_id), target_admin_id=message.from_user.id

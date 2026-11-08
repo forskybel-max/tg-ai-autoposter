@@ -14,7 +14,7 @@ for directory in (DATA_DIR, MEDIA_DIR, SESSIONS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 
-FREEBIE_BADGE = "🎁 <b>#халява</b>"
+FREEBIE_BADGE = "#халява"
 
 DEFAULT_STYLE_PROMPT = (
     "Ты — аккуратный редактор Telegram-канала. Твоя задача — БЕРЕЖНАЯ редактура, а не тотальное переписывание.\n"
@@ -76,7 +76,7 @@ def _parse_admin_ids(raw: str) -> list[int]:
 PROVIDER_DEFAULTS: dict[str, tuple[str, str]] = {
     "gemini": (
         "https://generativelanguage.googleapis.com/v1beta/openai",
-        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
     ),
     "openai": (
         "https://api.openai.com/v1",

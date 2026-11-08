@@ -169,6 +169,20 @@ class Database:
             ) as cursor:
                 return await cursor.fetchone() is not None
 
+    async def are_any_posts_processed(
+        self, source_chat_id: int, msg_ids: list[int]
+    ) -> bool:
+        if not msg_ids:
+            return False
+        placeholders = ",".join("?" for _ in msg_ids)
+        query = (
+            f"SELECT 1 FROM posts WHERE source_chat_id = ? "
+            f"AND source_msg_id IN ({placeholders}) LIMIT 1"
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(query, (source_chat_id, *msg_ids)) as cursor:
+                return await cursor.fetchone() is not None
+
     async def get_recent_post_snippets(self, limit: int = 15) -> list[str]:
         """Возвращает начала последних постов для проверки смысловых дублей."""
         async with aiosqlite.connect(self.db_path) as db:

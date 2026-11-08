@@ -129,12 +129,20 @@ async def main() -> None:
     logger.info("Не закрывайте это окно, пока бот должен работать.")
     logger.info("=========================================================")
 
+    active_sources = await db.get_sources(only_enabled=True)
+    source_titles = ", ".join(s["title"] for s in active_sources) if active_sources else "нет"
+    import html as _html
+
     for admin_id in config.admin_ids:
         try:
             hint = (
                 "Нажмите /start и кнопку <b>«🔑 Войти в Userbot»</b>, чтобы подключить чтение каналов."
                 if not ub_ready
-                else "Userbot активен и мониторит каналы. Нажмите /start для управления."
+                else (
+                    f"Userbot активен и мониторит <b>{len(active_sources)}</b> каналов:\n"
+                    f"<i>{_html.escape(source_titles)}</i>\n\n"
+                    "Нажмите /start для управления."
+                )
             )
             await bot.send_message(
                 chat_id=admin_id,
