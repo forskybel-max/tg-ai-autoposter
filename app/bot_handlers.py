@@ -20,7 +20,7 @@ from app.ai_service import AIService
 from app.config import Config, DEFAULT_STYLE_PROMPT
 from app.database import Database
 from app.publisher import Publisher, build_moderation_keyboard
-from app.userbot import UserbotParser
+from app.userbot import PremiumPublisherClient, UserbotParser
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,14 @@ class AdminStates(StatesGroup):
     waiting_for_login_phone = State()
     waiting_for_login_code = State()
     waiting_for_login_2fa = State()
+    waiting_for_pub_phone = State()
+    waiting_for_pub_code = State()
+    waiting_for_pub_2fa = State()
     waiting_for_ai_key = State()
     waiting_for_source = State()
     waiting_for_style_prompt = State()
     waiting_for_signature = State()
+    waiting_for_emoji_palette = State()
     waiting_for_manual_edit = State()
     waiting_for_rewrite_hint = State()
 
@@ -63,6 +67,7 @@ def setup_router(
     ai: AIService,
     publisher: Publisher,
     userbot: UserbotParser,
+    premium_publisher: PremiumPublisherClient | None = None,
 ) -> Router:
     router = Router()
     router.message.middleware(AdminOnlyMiddleware(config.admin_ids))
@@ -74,16 +79,31 @@ def setup_router(
         filter_ads = (await db.get_setting("filter_ads", "1")) == "1"
         auto_pub = (await db.get_setting("auto_publish", "0")) == "1"
         sig = await db.get_setting("channel_signature", "")
+        palette = await db.get_setting("custom_emoji_palette", "")
+        palette_cnt = AIService.count_custom_emojis(palette)
         is_ub_auth = await userbot.is_authorized()
         ub_label = await userbot.get_account_label()
+        pub_label = (
+            await premium_publisher.get_account_label()
+            if premium_publisher is not None
+            else "⚪ Не подключен (публикует бот)"
+        )
+        is_pub_auth = (
+            await premium_publisher.is_authorized()
+            if premium_publisher is not None
+            else False
+        )
 
         mode_str = "⚡ Автопилот (сразу в канал)" if auto_pub else "🛡 Предложка (с одобрением)"
         ads_str = "✅ Включен" if filter_ads else "❌ Выключен"
         sig_str = "Установлена" if sig.strip() else "Нет"
+        pal_str = f"{palette_cnt} шт." if palette_cnt > 0 else "Только из доноров"
 
         text = (
             "🤖 <b>Панель управления AI-Автопостером</b>\n\n"
-            f"👤 <b>Аккаунт-парсер (Userbot):</b> {ub_label}\n"
+            f"🕵️ <b>Парсер (Твинк):</b> {ub_label}\n"
+            f"💎 <b>Публикатор (Premium-основа):</b> {pub_label}\n"
+            f"✨ <b>Фирменные Premium-эмодзи:</b> {pal_str}\n"
             f"🎯 <b>Целевой канал:</b> <code>{config.target_channel}</code>\n"
             f"🧠 <b>Нейросеть:</b> <code>{config.ai_provider} / {config.ai_model}</code>\n"
             f"📡 <b>Каналов-доноров:</b> {active_count} активных (всего {len(sources)})\n"
@@ -120,6 +140,20 @@ def setup_router(
                 ],
                 [
                     InlineKeyboardButton(
+                        text=(
+                            "💎 Premium-основа (Подключена)"
+                            if is_pub_auth
+                            else "💎 Подключить Premium-основу"
+                        ),
+                        callback_data="menu:pub_login",
+                    ),
+                    InlineKeyboardButton(
+                        text=f"✨ Премиум-эмодзи ({palette_cnt})",
+                        callback_data="menu:emoji_palette",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text="🎨 Стиль ИИ (Промпт)", callback_data="menu:prompt"
                     ),
                     InlineKeyboardButton(
@@ -144,7 +178,7 @@ def setup_router(
                 ],
                 [
                     InlineKeyboardButton(
-                        text="☁️ Экспорт сессии (для деплоя в облако)",
+                        text="☁️ Экспорт сессий (для деплоя в облако)",
                         callback_data="menu:export_session",
                     )
                 ],
@@ -154,15 +188,35 @@ def setup_router(
 
     @router.callback_query(F.data == "menu:export_session")
     async def cb_export_session(call: CallbackQuery) -> None:
-        if not await userbot.is_authorized():
-            await call.answer("Сначала войдите в Userbot!", show_alert=True)
+        ub_ok = await userbot.is_authorized()
+        pub_ok = (
+            await premium_publisher.is_authorized()
+            if premium_publisher is not None
+            else False
+        )
+        if not ub_ok and not pub_ok:
+            await call.answer("Сначала войдите хотя бы в один аккаунт!", show_alert=True)
             return
-        session_str = userbot.export_string_session()
+
+        blocks: list[str] = []
+        if ub_ok:
+            session_str = userbot.export_string_session()
+            blocks.append(
+                "🕵️ <b>Сессия парсера (Твинк) — <code>TG_STRING_SESSION</code>:</b>\n"
+                f"<code>{session_str}</code>"
+            )
+        if pub_ok and premium_publisher is not None:
+            pub_str = premium_publisher.export_string_session()
+            blocks.append(
+                "💎 <b>Сессия публикатора (Основа с Premium) — <code>TG_PUBLISHER_STRING_SESSION</code>:</b>\n"
+                f"<code>{pub_str}</code>"
+            )
+
         await call.message.answer(
-            "☁️ <b>Ваша строка <code>TG_STRING_SESSION</code> для облачного хостинга:</b>\n"
-            "<i>(Никому её не передавайте! Укажите её в переменных окружения на Render / Koyeb / Railway / HF Spaces, "
-            "чтобы сессия Userbot не сбрасывалась при перезапуске контейнера):</i>\n\n"
-            f"<code>{session_str}</code>",
+            "☁️ <b>Ваши строковые сессии для облачного хостинга (Render):</b>\n"
+            "<i>(Никому их не передавайте! Укажите их в Environment Variables на Render, "
+            "чтобы авторизация сохранялась при пересборке контейнера):</i>\n\n"
+            + "\n\n".join(blocks),
             parse_mode="HTML",
         )
         await call.answer()
@@ -311,6 +365,88 @@ def setup_router(
         except Exception:
             pass
         ok, info = await userbot.submit_2fa_password(pwd)
+        if ok:
+            await state.clear()
+            text, kb = await render_main_menu_text()
+            await message.answer(f"{info}\n\n{text}", parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.answer(info, parse_mode="HTML")
+
+    # --- Авторизация Premium-публикатора (Основы) прямо через Telegram-бота ---
+
+    @router.callback_query(F.data == "menu:pub_login")
+    async def cb_pub_login(call: CallbackQuery, state: FSMContext) -> None:
+        if premium_publisher is None:
+            await call.answer("Модуль Premium-публикатора не инициализирован", show_alert=True)
+            return
+        await state.set_state(AdminStates.waiting_for_pub_phone)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="menu:home")]
+            ]
+        )
+        await call.message.edit_text(
+            "💎 <b>Подключение Premium-публикатора (Ваша Основа)</b>\n\n"
+            "🛡 <b>100% безопасно для основы:</b> этот аккаунт <b>НЕ</b> парсит каналы, не подписывается на доноров "
+            "и не делает фоновых запросов. Он используется <b>только</b> в момент нажатия кнопки «✅ Опубликовать в канал», "
+            "чтобы посты в вашем канале выходили с живыми платными анимированными эмодзи!\n\n"
+            "📌 <b>Требование:</b> этот аккаунт должен иметь Telegram Premium и быть добавлен в администраторы вашего "
+            f"целевого канала (<code>{config.target_channel}</code>) с правом «Публикация сообщений».\n\n"
+            "Отправьте номер телефона аккаунта с Premium в международном формате (например: <code>+79991234567</code>):",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        await call.answer()
+
+    @router.message(AdminStates.waiting_for_pub_phone)
+    async def msg_pub_phone(message: Message, state: FSMContext) -> None:
+        if not message.text or premium_publisher is None:
+            return
+        wait = await message.answer("⏳ Запрашиваю код входа для Premium-публикатора...")
+        ok, info = await premium_publisher.send_login_code(message.text)
+        if not ok:
+            await wait.edit_text(f"❌ {info}", parse_mode="HTML")
+            return
+
+        await state.set_state(AdminStates.waiting_for_pub_code)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Отмена", callback_data="menu:home")]
+            ]
+        )
+        await wait.edit_text(
+            f"📩 Код отправлен в приложение Telegram на номер <code>{info}</code>!\n\n"
+            "⚠️ <b>ВАЖНО:</b> введите цифры кода <b>ЧЕРЕЗ ПРОБЕЛ</b> (например: <code>1 2 3 4 5</code>)!\n"
+            "<i>Если переслать слитный код в чат, система безопасности Telegram автоматически аннулирует его.</i>",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    @router.message(AdminStates.waiting_for_pub_code)
+    async def msg_pub_code(message: Message, state: FSMContext) -> None:
+        if not message.text or premium_publisher is None:
+            return
+        status, info = await premium_publisher.submit_login_code(message.text)
+        if status == "ok":
+            await state.clear()
+            text, kb = await render_main_menu_text()
+            await message.answer(f"{info}\n\n{text}", parse_mode="HTML", reply_markup=kb)
+        elif status == "need_2fa":
+            await state.set_state(AdminStates.waiting_for_pub_2fa)
+            await message.answer(info, parse_mode="HTML")
+        else:
+            await message.answer(info, parse_mode="HTML")
+
+    @router.message(AdminStates.waiting_for_pub_2fa)
+    async def msg_pub_2fa(message: Message, state: FSMContext) -> None:
+        if not message.text or premium_publisher is None:
+            return
+        pwd = message.text.strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        ok, info = await premium_publisher.submit_2fa_password(pwd)
         if ok:
             await state.clear()
             text, kb = await render_main_menu_text()
@@ -606,12 +742,11 @@ def setup_router(
                 [InlineKeyboardButton(text="🔙 Назад", callback_data="menu:home")],
             ]
         )
-        preview = curr if curr else "<i>не задана</i>"
+        preview = AIService.strip_custom_emoji_tags(curr) if curr else "<i>не задана</i>"
         await call.message.edit_text(
             "✍️ <b>Настройка подписи в конце каждого поста</b>\n\n"
             f"Текущая подпись:\n{preview}\n\n"
-            "Отправьте новую подпись (поддерживается HTML, например:\n"
-            '<code>👉 &lt;a href="https://t.me/my_channel"&gt;Подписаться на канал&lt;/a&gt;</code>):',
+            "Отправьте новую подпись (поддерживаются жирный шрифт, ссылки и платные анимированные эмодзи):",
             parse_mode="HTML",
             reply_markup=kb,
             disable_web_page_preview=True,
@@ -634,6 +769,71 @@ def setup_router(
         text, kb = await render_main_menu_text()
         await message.answer(
             "✅ Подпись канала сохранена!", reply_markup=kb, parse_mode="HTML"
+        )
+
+    # --- Фирменный набор платных анимированных эмодзи ---
+
+    @router.callback_query(F.data == "menu:emoji_palette")
+    async def cb_emoji_palette_menu(call: CallbackQuery, state: FSMContext) -> None:
+        curr = await db.get_setting("custom_emoji_palette", "")
+        tags = AIService.extract_custom_emoji_tags(curr)
+        await state.set_state(AdminStates.waiting_for_emoji_palette)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Очистить набор", callback_data="menu:clear_emoji_palette"
+                    )
+                ],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="menu:home")],
+            ]
+        )
+        tags_preview = (
+            "\n".join(f"• <code>{html.escape(t)}</code>" for t in tags[:15])
+            if tags
+            else "<i>Пока не заданы (используются только анимированные эмодзи из постов-доноров)</i>"
+        )
+        await call.message.edit_text(
+            "✨ <b>Фирменные платные анимированные эмодзи канала</b>\n\n"
+            f"Сохранено эмодзи: <b>{len(tags)} шт.</b>\n{tags_preview}\n\n"
+            "💡 <b>Как добавить:</b> просто отправьте в ответ одно сообщение со своими любимыми "
+            "анимированными Telegram Premium эмодзи (например: 🔥 ⚡ 🧠 🚀 💎).\n"
+            "Бот сам считает их <code>emoji-id</code>, и нейросеть будет автоматически украшать ими "
+            "заголовки и списки даже тех постов, где у донора анимаций не было!",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "menu:clear_emoji_palette")
+    async def cb_clear_emoji_palette(call: CallbackQuery, state: FSMContext) -> None:
+        await db.set_setting("custom_emoji_palette", "")
+        await state.clear()
+        await call.answer("Фирменный набор эмодзи очищен!")
+        text, kb = await render_main_menu_text()
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+    @router.message(AdminStates.waiting_for_emoji_palette)
+    async def msg_save_emoji_palette(message: Message, state: FSMContext) -> None:
+        raw_html = message.html_text or message.text or ""
+        tags = AIService.extract_custom_emoji_tags(raw_html)
+        if not tags:
+            await message.answer(
+                "⚠️ В вашем сообщении не найдено платных кастомных эмодзи (<code>&lt;tg-emoji&gt;</code>).\n"
+                "Отправьте эмодзи именно из платного набора Telegram Premium (или нажмите «🔙 Назад»).",
+                parse_mode="HTML",
+            )
+            return
+
+        palette_str = " ".join(tags)
+        await db.set_setting("custom_emoji_palette", palette_str)
+        await state.clear()
+        text, kb = await render_main_menu_text()
+        await message.answer(
+            f"✅ <b>Сохранено фирменных анимированных эмодзи: {len(tags)} шт.!</b>\n"
+            "Теперь ИИ будет автоматически использовать их при оформлении постов.",
+            reply_markup=kb,
+            parse_mode="HTML",
         )
 
     # --- Действия в Предложке (Модерация постов) ---
@@ -734,7 +934,9 @@ def setup_router(
             post_id, has_media, use_media, is_freebie=new_freebie
         )
         preview_text = AIService.balance_telegram_html(
-            publisher.build_preview_text(post, len(media_items), has_media, use_media)
+            AIService.strip_custom_emoji_tags(
+                publisher.build_preview_text(post, len(media_items), has_media, use_media)
+            )
         )
 
         try:

@@ -29,12 +29,46 @@ from telethon.tl.types import (
     MessageEntitySpoiler,
 )
 
-# Регистрируем поддержку <tg-spoiler> и чистого <pre> для точного переноса форматирования
+# Регистрируем поддержку <tg-spoiler> и чистого <pre> для точного переноса форматирования (в обе стороны: unparse и parse)
 tg_html.ENTITY_TO_FORMATTER[MessageEntitySpoiler] = ("<tg-spoiler>", "</tg-spoiler>")
 tg_html.ENTITY_TO_FORMATTER[MessageEntityPre] = lambda e, _: (
     f'<pre><code class="language-{e.language}">' if getattr(e, "language", "") else "<pre>",
     "</code></pre>" if getattr(e, "language", "") else "</pre>",
 )
+
+_orig_handle_starttag = tg_html.HTMLToTelegramParser.handle_starttag
+
+
+def _patched_handle_starttag(self, tag, attrs):
+    if tag == "tg-spoiler":
+        self._open_tags.appendleft(tag)
+        self._open_tags_meta.appendleft(None)
+        if tag not in self._building_entities:
+            self._building_entities[tag] = MessageEntitySpoiler(
+                offset=len(self.text), length=0
+            )
+        return
+    return _orig_handle_starttag(self, tag, attrs)
+
+
+tg_html.HTMLToTelegramParser.handle_starttag = _patched_handle_starttag
+
+_orig_unparse = tg_html.unparse
+
+
+def _patched_unparse(text: str, entities):
+    if entities:
+        # Сортируем сущности так, чтобы внешние/длинные теги (например, <b>Заголовок</b>)
+        # открывались раньше вложенных коротких (<tg-emoji>🔥</tg-emoji>) при одинаковом offset
+        sorted_ents = sorted(
+            entities,
+            key=lambda e: (getattr(e, "offset", 0), -getattr(e, "length", 0)),
+        )
+        return _orig_unparse(text, sorted_ents)
+    return _orig_unparse(text, entities)
+
+
+tg_html.unparse = _patched_unparse
 
 from app.ai_service import AIService
 from app.config import Config, MEDIA_DIR
@@ -745,3 +779,272 @@ class UserbotParser:
                 logger.warning("Не удалось скачать медиа поста %s: %s", m.id, exc)
 
         return downloaded
+
+
+class PremiumPublisherClient:
+    """
+    Отдельный легковесный Telethon-клиент для основного аккаунта с Telegram Premium.
+    НЕ подписывается на каналы, НЕ слушает сообщения и НЕ занимается парсингом (0% риска для основы).
+    Используется исключительно для отправки одобренных постов в целевой канал,
+    чтобы Telegram активировал платные анимированные эмодзи (<tg-emoji emoji-id="...">).
+    """
+
+    def __init__(self, config: Config, db: Database):
+        self.config = config
+        self.db = db
+        session_obj = (
+            StringSession(self.config.tg_publisher_string_session)
+            if self.config.tg_publisher_string_session
+            else (self.config.tg_publisher_session_name or StringSession())
+        )
+        self.client = TelegramClient(
+            session_obj,
+            self.config.tg_api_id,
+            self.config.tg_api_hash,
+            system_version="4.16.30-vxCUSTOM",
+            receive_updates=False,
+        )
+        self._pending_phone: str | None = None
+        self._pending_phone_hash: str | None = None
+        self._dialogs_warmed: bool = False
+
+    def export_string_session(self) -> str:
+        return StringSession.save(self.client.session)
+
+    async def start(self) -> bool:
+        """Проверяет наличие сохранённой сессии публикатора (в env или БД) и подключает её."""
+        if not self.config.tg_publisher_string_session:
+            db_sess = (await self.db.get_setting("publisher_string_session", "")).strip()
+            if db_sess:
+                self.config.tg_publisher_string_session = db_sess
+                self.client = TelegramClient(
+                    StringSession(db_sess),
+                    self.config.tg_api_id,
+                    self.config.tg_api_hash,
+                    system_version="4.16.30-vxCUSTOM",
+                    receive_updates=False,
+                )
+
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            if await self.client.is_user_authorized():
+                me = await self.client.get_me()
+                is_prem = bool(getattr(me, "premium", False))
+                logger.info(
+                    "Premium-публикатор (Основа) подключен: %s (ID: %s, Premium=%s)",
+                    getattr(me, "first_name", "User"),
+                    me.id,
+                    is_prem,
+                )
+                return True
+        except Exception as exc:
+            logger.warning("Не удалось инициализировать Premium-публикатор: %s", exc)
+        return False
+
+    async def stop(self) -> None:
+        if self.client.is_connected():
+            await self.client.disconnect()
+
+    async def is_authorized(self) -> bool:
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            return await self.client.is_user_authorized()
+        except Exception:
+            return False
+
+    async def get_account_label(self) -> str:
+        if not await self.is_authorized():
+            return "⚪ Не подключен (публикует бот)"
+        me = await self.client.get_me()
+        name = getattr(me, "first_name", "") or "User"
+        username = getattr(me, "username", None)
+        is_prem = bool(getattr(me, "premium", False))
+        prem_badge = "💎 Premium" if is_prem else "⚠️ без Premium"
+        suffix = f"@{username}" if username else f"ID: {me.id}"
+        return f"✅ {name} ({suffix}, {prem_badge})"
+
+    async def _persist_session(self) -> str:
+        sess_str = self.export_string_session()
+        self.config.tg_publisher_string_session = sess_str
+        await self.db.set_setting("publisher_string_session", sess_str)
+        try:
+            from dotenv import set_key
+            from app.config import BASE_DIR
+
+            env_file = BASE_DIR / ".env"
+            if env_file.exists():
+                set_key(str(env_file), "TG_PUBLISHER_STRING_SESSION", sess_str)
+        except Exception:
+            pass
+        return sess_str
+
+    async def send_login_code(self, phone: str) -> tuple[bool, str]:
+        clean_phone = re.sub(r"[^\d+]", "", phone.strip())
+        if not clean_phone.startswith("+"):
+            clean_phone = "+" + clean_phone
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            sent = await self.client.send_code_request(clean_phone)
+            self._pending_phone = clean_phone
+            self._pending_phone_hash = sent.phone_code_hash
+            return True, clean_phone
+        except Exception as exc:
+            logger.exception("Ошибка отправки кода для Premium-публикатора на %s: %s", clean_phone, exc)
+            return False, f"Не удалось отправить код: <code>{exc}</code>"
+
+    async def submit_login_code(self, raw_code: str) -> tuple[str, str]:
+        code = re.sub(r"\D", "", raw_code)
+        if not code:
+            return "error", "В сообщении не найдено цифр кода. Попробуйте ещё раз."
+        if not self._pending_phone or not self._pending_phone_hash:
+            return "error", "Сессия ввода номера истекла. Начните вход заново."
+
+        try:
+            await self.client.sign_in(
+                phone=self._pending_phone,
+                code=code,
+                phone_code_hash=self._pending_phone_hash,
+            )
+            self._pending_phone = None
+            self._pending_phone_hash = None
+            self._dialogs_warmed = False
+            sess_str = await self._persist_session()
+            label = await self.get_account_label()
+            return (
+                "ok",
+                f"🎉 <b>Premium-публикатор успешно подключен:</b> {label}!\n\n"
+                f"☁️ Строка <code>TG_PUBLISHER_STRING_SESSION</code> (для Render):\n"
+                f"<code>{sess_str}</code>",
+            )
+        except SessionPasswordNeededError:
+            return (
+                "need_2fa",
+                "🔐 На этом аккаунте включен <b>облачный пароль (2FA)</b>.\n"
+                "Отправьте пароль ответным сообщением (бот сразу удалит ваше сообщение с паролем из чата):",
+            )
+        except PhoneCodeInvalidError:
+            return "error", "❌ Неверный код. Проверьте цифры и отправьте снова (через пробел, например <code>1 2 3 4 5</code>)."
+        except PhoneCodeExpiredError:
+            return (
+                "error",
+                "⚠️ Код истек или был заблокирован Telegram (не пересылайте код напрямую без пробелов!). "
+                "Запросите новый код и введите его через пробелы: <code>1 2 3 4 5</code>.",
+            )
+        except Exception as exc:
+            logger.exception("Ошибка входа в Premium-публикатор: %s", exc)
+            return "error", f"❌ Ошибка авторизации: <code>{exc}</code>"
+
+    async def submit_2fa_password(self, password: str) -> tuple[bool, str]:
+        try:
+            await self.client.sign_in(password=password)
+            self._pending_phone = None
+            self._pending_phone_hash = None
+            self._dialogs_warmed = False
+            sess_str = await self._persist_session()
+            label = await self.get_account_label()
+            return (
+                True,
+                f"🎉 <b>Premium-публикатор успешно подключен:</b> {label}!\n\n"
+                f"☁️ Строка <code>TG_PUBLISHER_STRING_SESSION</code> (для Render):\n"
+                f"<code>{sess_str}</code>",
+            )
+        except Exception as exc:
+            logger.exception("Ошибка ввода 2FA для Premium-публикатора: %s", exc)
+            return False, f"❌ Неверный облачный пароль или ошибка: <code>{exc}</code>"
+
+    async def _resolve_target(self, target: int | str):
+        try:
+            return await self.client.get_entity(target)
+        except ValueError:
+            if not self._dialogs_warmed:
+                await self.client.get_dialogs(limit=150)
+                self._dialogs_warmed = True
+            return await self.client.get_entity(target)
+
+    async def _send_html_text(self, entity, text: str) -> None:
+        safe_html = AIService.truncate_telegram_html(text, 4090)
+        await self.client.send_message(
+            entity,
+            safe_html,
+            parse_mode="html",
+            link_preview=False,
+        )
+
+    async def _send_single_media(self, entity, item: dict, caption: str | None) -> None:
+        safe_caption = AIService.truncate_telegram_html(caption, 1024) if caption else None
+        if item.get("type") == "video":
+            attrs = []
+            w = int(item.get("width") or 0)
+            h = int(item.get("height") or 0)
+            dur = int(item.get("duration") or 0)
+            if w or h or dur:
+                attrs.append(
+                    DocumentAttributeVideo(
+                        duration=dur,
+                        w=w or 720,
+                        h=h or 1280,
+                        supports_streaming=True,
+                    )
+                )
+            thumb = item.get("thumb_path")
+            thumb_arg = thumb if (thumb and Path(thumb).exists()) else None
+            await self.client.send_file(
+                entity,
+                item["path"],
+                caption=safe_caption,
+                parse_mode="html" if safe_caption else None,
+                supports_streaming=True,
+                attributes=attrs or None,
+                thumb=thumb_arg,
+            )
+        else:
+            await self.client.send_file(
+                entity,
+                item["path"],
+                caption=safe_caption,
+                parse_mode="html" if safe_caption else None,
+            )
+
+    async def publish_post(
+        self,
+        target: int | str,
+        text: str,
+        media_items: list[dict],
+        use_media: bool,
+    ) -> bool:
+        """Публикует пост в целевой канал через аккаунт с Telegram Premium."""
+        if not await self.is_authorized():
+            return False
+
+        entity = await self._resolve_target(target)
+        if not use_media:
+            if not text:
+                return False
+            await self._send_html_text(entity, text)
+        elif len(media_items) == 1:
+            item = media_items[0]
+            if len(text) <= 1024:
+                await self._send_single_media(entity, item, caption=text or None)
+            else:
+                await self._send_single_media(entity, item, caption=None)
+                await self._send_html_text(entity, text)
+        else:
+            caption_for_album = (
+                AIService.truncate_telegram_html(text, 1024)
+                if (text and len(text) <= 1024)
+                else None
+            )
+            files = [m["path"] for m in media_items[:10]]
+            await self.client.send_file(
+                entity,
+                files,
+                caption=caption_for_album,
+                parse_mode="html" if caption_for_album else None,
+                supports_streaming=True,
+            )
+            if len(text) > 1024:
+                await self._send_html_text(entity, text)
+        return True

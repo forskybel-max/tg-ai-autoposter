@@ -56,6 +56,8 @@ class Database:
                 "channel_signature": "",
                 "filter_ads": "1",
                 "auto_publish": "0",
+                "custom_emoji_palette": "",
+                "publisher_string_session": "",
             }
             for k, v in defaults.items():
                 await db.execute(
@@ -63,10 +65,13 @@ class Database:
                     (k, v),
                 )
 
-            # Обновляем старый дефолтный промпт на бережную редактуру с сохранением цитат и ссылок
+            # Обновляем старый дефолтный промпт на современную вёрстку с заголовками, цитатами, ссылками и <tg-emoji>
             async with db.execute("SELECT value FROM settings WHERE key = 'style_prompt'") as cur:
                 row = await cur.fetchone()
-                if row and "опытный главный редактор" in row[0]:
+                if row and (
+                    "опытный главный редактор" in row[0]
+                    or "аккуратный редактор Telegram-канала" in row[0]
+                ):
                     await db.execute(
                         "UPDATE settings SET value = ? WHERE key = 'style_prompt'",
                         (DEFAULT_STYLE_PROMPT,),

@@ -79,10 +79,11 @@ def build_moderation_keyboard(
 
 
 class Publisher:
-    def __init__(self, bot: Bot, config: Config, db: Database):
+    def __init__(self, bot: Bot, config: Config, db: Database, premium_publisher: Any = None):
         self.bot = bot
         self.config = config
         self.db = db
+        self.premium_publisher = premium_publisher
 
     @staticmethod
     def _video_kwargs(item: dict[str, Any]) -> dict[str, Any]:
@@ -112,9 +113,15 @@ class Publisher:
             if has_media
             else "📎 Без медиа"
         )
+        custom_emoji_cnt = AIService.count_custom_emojis(post.get("rewritten_text", ""))
+        emoji_line = (
+            f"\n💎 <i>Анимированных эмодзи в посте: {custom_emoji_cnt} шт. (оживут в канале)</i>"
+            if custom_emoji_cnt > 0
+            else ""
+        )
         header = (
             f"📥 <b>Предложка #{post['id']}</b> | Источник: <b>{html.escape(post['source_title'])}</b>\n"
-            f"<i>{media_badge}</i>\n"
+            f"<i>{media_badge}</i>{emoji_line}\n"
             f"{'─' * 22}\n\n"
         )
         return f"{header}{post['rewritten_text']}"
@@ -126,7 +133,9 @@ class Publisher:
         reply_to_message_id: int | None = None,
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
-        safe_html = AIService.truncate_telegram_html(text, 4090)
+        # Для стандартного Bot API убираем обёртку <tg-emoji>, оставляя сам смайлик и всю HTML-вёрстку
+        bot_ready_html = AIService.strip_custom_emoji_tags(text)
+        safe_html = AIService.truncate_telegram_html(bot_ready_html, 4090)
         try:
             await self.bot.send_message(
                 chat_id=chat_id,
@@ -158,7 +167,8 @@ class Publisher:
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
         file = FSInputFile(item["path"])
-        safe_caption = AIService.truncate_telegram_html(caption, 1024) if caption else None
+        bot_ready_cap = AIService.strip_custom_emoji_tags(caption) if caption else None
+        safe_caption = AIService.truncate_telegram_html(bot_ready_cap, 1024) if bot_ready_cap else None
         try:
             if item["type"] == "video":
                 await self.bot.send_video(
@@ -273,7 +283,12 @@ class Publisher:
                 )
 
     async def publish_to_channel(self, post_id: int) -> bool:
-        """Публикует пост в целевой канал TARGET_CHANNEL."""
+        """
+        Публикует пост в целевой канал TARGET_CHANNEL.
+        Если подключен Premium-публикатор (основа с Telegram Premium) — публикует через него
+        с сохранением всех платных анимированных эмодзи (<tg-emoji emoji-id="...">).
+        Иначе (или при ошибке прав) автоматически публикует через стандартного бота.
+        """
         post = await self.db.get_post(post_id)
         if not post:
             return False
@@ -285,11 +300,36 @@ class Publisher:
         use_media = bool(post["use_media"]) and len(media_items) > 0
         target = self.config.target_channel
 
+        if not use_media and not text:
+            logger.warning("Пост #%s не содержит ни медиа, ни текста — публикация отменена.", post_id)
+            return False
+
+        # 1. Попытка публикации через аккаунт с Telegram Premium (для живых анимированных <tg-emoji>)
+        if self.premium_publisher is not None:
+            try:
+                if await self.premium_publisher.is_authorized():
+                    pub_ok = await self.premium_publisher.publish_post(
+                        target=target,
+                        text=text,
+                        media_items=media_items,
+                        use_media=use_media,
+                    )
+                    if pub_ok:
+                        logger.info("Пост #%s опубликован в канал через Premium-публикатор!", post_id)
+                        await self.db.update_post_status(post_id, "published")
+                        self.cleanup_post_media(post)
+                        return True
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось опубликовать пост #%s через Premium-публикатор (%s), "
+                    "выполняем резервную публикацию через бота...",
+                    post_id,
+                    exc,
+                )
+
+        # 2. Публикация через стандартного бота (Bot API)
         try:
             if not use_media:
-                if not text:
-                    logger.warning("Пост #%s не содержит ни медиа, ни текста — публикация отменена.", post_id)
-                    return False
                 await self._send_text_safe(chat_id=target, text=text)
             elif len(media_items) == 1:
                 item = media_items[0]
@@ -309,7 +349,8 @@ class Publisher:
                     await self._send_text_safe(chat_id=target, text=text)
             else:
                 # Публикация медиа-альбома (2–10 файлов)
-                caption_for_album = text if (text and len(text) <= 1024) else None
+                bot_ready_text = AIService.strip_custom_emoji_tags(text)
+                caption_for_album = bot_ready_text if (bot_ready_text and len(bot_ready_text) <= 1024) else None
                 media_group = self._build_media_group(
                     media_items, caption=caption_for_album
                 )
@@ -324,7 +365,7 @@ class Publisher:
                         await self.bot.send_media_group(chat_id=target, media=media_group_plain)
                     else:
                         raise
-                if len(text) > 1024:
+                if len(bot_ready_text) > 1024:
                     await self._send_text_safe(chat_id=target, text=text)
 
             await self.db.update_post_status(post_id, "published")

@@ -12,7 +12,7 @@ from app.bot_handlers import setup_router
 from app.config import MEDIA_DIR, load_config
 from app.database import Database
 from app.publisher import Publisher
-from app.userbot import UserbotParser
+from app.userbot import PremiumPublisherClient, UserbotParser
 
 
 def setup_logging() -> None:
@@ -91,7 +91,13 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     ai_service = AIService(config=config, db=db)
-    publisher = Publisher(bot=bot, config=config, db=db)
+    premium_publisher = PremiumPublisherClient(config=config, db=db)
+    publisher = Publisher(
+        bot=bot,
+        config=config,
+        db=db,
+        premium_publisher=premium_publisher,
+    )
     userbot = UserbotParser(
         config=config,
         db=db,
@@ -105,6 +111,7 @@ async def main() -> None:
         ai=ai_service,
         publisher=publisher,
         userbot=userbot,
+        premium_publisher=premium_publisher,
     )
     dp.include_router(router)
 
@@ -118,6 +125,7 @@ async def main() -> None:
 
     logger.info("Подключение к Telegram...")
     ub_ready = await userbot.start()
+    pub_ready = await premium_publisher.start()
 
     bot_info = await bot.get_me()
     logger.info("=========================================================")
@@ -126,6 +134,8 @@ async def main() -> None:
         logger.info("Откройте @%s в Telegram, нажмите /start и кнопку 'Войти в Userbot'!", bot_info.username)
     else:
         logger.info("Userbot авторизован и слушает каналы-доноры!")
+    if pub_ready:
+        logger.info("Premium-публикатор авторизован и готов публиковать посты с <tg-emoji>!")
     logger.info("Не закрывайте это окно, пока бот должен работать.")
     logger.info("=========================================================")
 
@@ -133,14 +143,20 @@ async def main() -> None:
     source_titles = ", ".join(s["title"] for s in active_sources) if active_sources else "нет"
     import html as _html
 
+    pub_status_line = (
+        "💎 <b>Premium-публикатор:</b> подключен (анимации активны)\n"
+        if pub_ready
+        else "💎 <b>Premium-публикатор:</b> не подключен (можно подключить в /start)\n"
+    )
     for admin_id in config.admin_ids:
         try:
             hint = (
                 "Нажмите /start и кнопку <b>«🔑 Войти в Userbot»</b>, чтобы подключить чтение каналов."
                 if not ub_ready
                 else (
-                    f"Userbot активен и мониторит <b>{len(active_sources)}</b> каналов:\n"
-                    f"<i>{_html.escape(source_titles)}</i>\n\n"
+                    f"🕵️ Userbot мониторит <b>{len(active_sources)}</b> каналов:\n"
+                    f"<i>{_html.escape(source_titles)}</i>\n"
+                    f"{pub_status_line}\n"
                     "Нажмите /start для управления."
                 )
             )
@@ -168,6 +184,7 @@ async def main() -> None:
         cleanup_task.cancel()
         if health_runner:
             await health_runner.cleanup()
+        await premium_publisher.stop()
         await userbot.stop()
         await bot.session.close()
 

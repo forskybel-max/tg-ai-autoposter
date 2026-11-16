@@ -42,6 +42,7 @@ class AIService:
         style_prompt = await self.db.get_setting("style_prompt")
         signature = await self.db.get_setting("channel_signature")
         filter_ads = (await self.db.get_setting("filter_ads", "1")) == "1"
+        custom_palette = (await self.db.get_setting("custom_emoji_palette", "")).strip()
         recent_snippets = await self.db.get_recent_post_snippets(limit=12)
 
         if not original_text or not original_text.strip():
@@ -58,6 +59,23 @@ class AIService:
             recent_context = (
                 "\nСписок недавно обработанных постов (для проверки смысловых дублей):\n"
                 f"{formatted}\n"
+            )
+
+        orig_custom_emojis = self.extract_custom_emoji_tags(original_text)
+        emoji_context = ""
+        if orig_custom_emojis:
+            emoji_context += (
+                "\nВ исходном посте есть платные анимированные Telegram Premium эмодзи — "
+                "ОБЯЗАТЕЛЬНО используй эти точные теги в заголовке и ключевых местах поста:\n"
+                + " ".join(orig_custom_emojis)
+                + "\n"
+            )
+        if custom_palette:
+            emoji_context += (
+                "\nФирменный набор платных анимированных эмодзи нашего канала "
+                "(используй 1–3 подходящих по смыслу тега <tg-emoji> в заголовке и буллетах списка, "
+                "особенно если в исходнике не было своих <tg-emoji>):\n"
+                f"{custom_palette}\n"
             )
 
         ad_rule = (
@@ -88,25 +106,28 @@ class AIService:
         )
 
         tech_rules = (
-            "Обязательные правила бережной редактуры, оформления и рубрик:\n"
-            "1. НЕ переписывай сильно там, где исходный текст уже написан коротко и по делу! Делай только лёгкий, естественный рерайт "
-            "без отсебятины, без «воды» и без пафосных клише.\n"
-            "2. СОХРАНЯЙ оригинальное форматирование и визуальную структуру: если в исходнике есть цитаты "
-            "(<blockquote>...</blockquote> или <blockquote expandable>...</blockquote>), списки, код (<code>, <pre>), "
-            "спойлеры (<tg-spoiler>) или жирные акценты — обязательно перенеси эти же теги в итоговый текст!\n"
-            "3. ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
-            'через HTML-тег <a href="https://...">текст</a>.\n'
-            "4. УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n"
-            "5. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
+            "Обязательные правила стильной вёрстки, оформления и рубрик:\n"
+            "1. ВЫРАЗИТЕЛЬНЫЙ ЗАГОЛОВОК: Первая строка поста ВСЕГДА должна быть цепляющим жирным заголовком <b>...</b> "
+            "с тематическим эмодзи (или <tg-emoji emoji-id=\"...\"> из исходника/палитры).\n"
+            "2. СТРУКТУРА И СПИСКИ: Оформляй текст красиво и структурно! Перечисления фактов, фич или условий давай списком "
+            "через маркер «•» с жирным выделением ключевой сути (• <b>Что нового:</b> ...). Без пустой «воды» и выдуманных фактов.\n"
+            "3. ЦИТАТЫ И ПАНЧЛАЙНЫ: Ироничные ремарки (в том числе шутки в скобках), выводы, прямую речь или яркие мысли "
+            "оформляй в блок цитаты <blockquote>...</blockquote> (а длинные свёрнутые цитаты — в <blockquote expandable>...</blockquote>).\n"
+            "4. ПЛАТНЫЕ АНИМИРОВАННЫЕ ЭМОДЗИ (<tg-emoji>): Если в исходном посте или в фирменном наборе есть теги "
+            '<tg-emoji emoji-id="ЧИСЛО">эмодзи</tg-emoji> — ОБЯЗАТЕЛЬНО сохраняй их вместе с точным числовым emoji-id!\n'
+            "5. ССЫЛКИ: ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
+            'через HTML-тег <a href="https://...">текст</a>. УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n'
+            "6. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
             "к крутому платному инструменту/ИИ, промокод на бесплатную подписку, 100% скидка и т.п.) — поставь в JSON поле "
             '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит его после заголовка автоматически!\n'
-            "6. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
-            "<tg-spoiler>, <a href=\"...\"> (никакого Markdown **текст** или > цитата)."
+            "7. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
+            "<tg-spoiler>, <a href=\"...\">, <tg-emoji emoji-id=\"...\"> (никакого Markdown **текст** или > цитата)."
         )
 
         system_prompt = (
             f"{style_prompt}\n\n"
-            f"{tech_rules}\n\n"
+            f"{tech_rules}\n"
+            f"{emoji_context}\n"
             f"{length_rule}\n"
             f"{ad_rule}\n"
             f"{recent_context}"
@@ -116,7 +137,7 @@ class AIService:
             '  "is_rejected": false,\n'
             '  "reject_reason": "",\n'
             '  "is_freebie": false,\n'
-            '  "rewritten_text": "Бережно отредактированный текст с сохранением <blockquote>, <b>, <a href=...>"\n'
+            '  "rewritten_text": "<b>Заголовок</b>\\n\\nСтильно оформленный текст с <blockquote>, списками, <a href=...> и <tg-emoji emoji-id=...>..."\n'
             "}"
         )
 
@@ -130,6 +151,9 @@ class AIService:
             return parsed
 
         cleaned_text = self._sanitize_html_and_links(parsed.rewritten_text)
+        cleaned_text = self._restore_dropped_custom_emojis(
+            cleaned_text, original_text, custom_palette
+        )
         if parsed.is_freebie or self.has_freebie_tag(cleaned_text):
             cleaned_text = self.set_freebie_tag(cleaned_text, enabled=True)
 
@@ -462,6 +486,91 @@ class AIService:
         )
 
     @staticmethod
+    def extract_custom_emoji_tags(text: str) -> list[str]:
+        """Извлекает уникальные теги <tg-emoji emoji-id="...">...</tg-emoji> из HTML."""
+        if not text:
+            return []
+        pattern = re.compile(
+            r'<tg-emoji\s+(?:emoji-id|document-id)=["\']?(\d+)["\']?\s*>(.*?)</tg-emoji>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in pattern.finditer(text):
+            eid = m.group(1)
+            raw_inner = re.sub(r"</?[a-zA-Z0-9_-]+[^>]*>", "", m.group(2)).strip()
+            inner = raw_inner or "✨"
+            tag = f'<tg-emoji emoji-id="{eid}">{inner}</tg-emoji>'
+            if tag not in seen:
+                seen.add(tag)
+                result.append(tag)
+        return result
+
+    @staticmethod
+    def count_custom_emojis(text: str) -> int:
+        """Считает количество вхождений <tg-emoji emoji-id="..."> в тексте."""
+        if not text:
+            return 0
+        return len(
+            re.findall(
+                r'<tg-emoji\s+(?:emoji-id|document-id)=["\']?\d+["\']?\s*>',
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _restore_dropped_custom_emojis(
+        cls, rewritten: str, original: str, palette: str = ""
+    ) -> str:
+        """
+        Если в исходнике (или фирменной палитре) были <tg-emoji emoji-id="ID">🔥,
+        а нейросеть при рерайте написала просто голый смайлик 🔥 без тега <tg-emoji>,
+        автоматически восстанавливает на нём платный анимированный тег!
+        """
+        if not rewritten:
+            return rewritten
+
+        source_tags = cls.extract_custom_emoji_tags(original) + cls.extract_custom_emoji_tags(palette)
+        if not source_tags:
+            return rewritten
+
+        # Сопоставляем внутренний смайлик -> полный тег <tg-emoji emoji-id="...">смайлик</tg-emoji>
+        emoji_map: dict[str, str] = {}
+        for tag in source_tags:
+            m = re.match(
+                r'^(<tg-emoji\s+emoji-id="\d+">)(.+?)(</tg-emoji>)$',
+                tag,
+                flags=re.DOTALL,
+            )
+            if m:
+                inner_char = m.group(2).strip()
+                # Не заменяем обычные буквы/цифры, только эмодзи/символы
+                if inner_char and not any(ch.isalnum() for ch in inner_char) and inner_char not in emoji_map:
+                    emoji_map[inner_char] = tag
+
+        out = rewritten
+        for plain_emoji, full_tag in emoji_map.items():
+            # Заменяем голый смайлик только там, где он ещё НЕ обёрнут в <tg-emoji>
+            escaped = re.escape(plain_emoji)
+            out = re.sub(
+                rf'(?<!">){escaped}(?!</tg-emoji>)',
+                full_tag,
+                out,
+            )
+
+        # Если в исходном посте были кастомные эмодзи, но в результате всё ещё 0 <tg-emoji>,
+        # аккуратно ставим первый кастомный эмодзи оригинала в начало заголовка
+        if cls.count_custom_emojis(out) == 0 and cls.extract_custom_emoji_tags(original):
+            first_custom = cls.extract_custom_emoji_tags(original)[0]
+            if out.startswith("<b>"):
+                out = f"<b>{first_custom} " + out[3:]
+            else:
+                out = f"{first_custom} {out}"
+
+        return cls.balance_telegram_html(out, strip_tg_links=True)
+
+    @staticmethod
     def has_freebie_tag(text: str) -> bool:
         return bool(re.search(r"#халява\b", text, flags=re.IGNORECASE))
 
@@ -495,10 +604,10 @@ class AIService:
         if not sep:
             # Если текст в один абзац без переноса строки и начинается с короткого жирного заголовка с точкой/разделителем
             m = re.match(
-                r"^((?:[^\w<\n]{0,6}\s*)?<(?:b|strong)>[^<\n]{2,110}</(?:b|strong)>(?:[.!?:])?)(?:\s+(.{30,}))$",
+                r"^((?:(?:<tg-emoji[^>]*>.*?</tg-emoji>|[^\w<\n]){0,6}\s*)?<(?:b|strong)>.*?</(?:b|strong)>(?:[.!?:])?)(?:\s+(.{30,}))$",
                 cleaned,
             )
-            if m:
+            if m and len(m.group(1)) <= 220:
                 return f"{m.group(1).rstrip()} {FREEBIE_BADGE} {m.group(2).lstrip()}"
             return f"{cleaned.rstrip()} {FREEBIE_BADGE}"
 
@@ -509,6 +618,7 @@ class AIService:
         """
         Приводит HTML-разметку к строго валидному для Telegram виду:
         - нормализует strong->b, em->i, del/strike->s, ins->u;
+        - сохраняет платные анимированные эмодзи <tg-emoji emoji-id="...">...</tg-emoji>;
         - удаляет одиночные закрывающие теги (Unexpected end tag);
         - исправляет перекрёстное закрытие тегов по LIFO-стеку и закрывает незакрытые теги.
         """
@@ -519,12 +629,16 @@ class AIService:
             "del": "s",
             "strike": "s",
         }
-        allowed = {"b", "i", "u", "s", "code", "pre", "blockquote", "tg-spoiler", "a"}
+        allowed = {"b", "i", "u", "s", "code", "pre", "blockquote", "tg-spoiler", "a", "tg-emoji"}
         token_re = re.compile(r"<(/?)([a-zA-Z0-9-]+)([^>]*)>")
 
         out: list[str] = []
-        stack: list[str] = []
+        # stack хранит кортежи (norm_tag, open_html_str)
+        stack: list[tuple[str, str]] = []
         last_idx = 0
+
+        def _in_stack(tag_name: str) -> bool:
+            return any(t == tag_name for t, _ in stack)
 
         for m in token_re.finditer(text):
             out.append(text[last_idx : m.start()])
@@ -539,7 +653,7 @@ class AIService:
                 continue
 
             if not is_close:
-                if norm_tag in ("a", "blockquote", "pre") and norm_tag in stack:
+                if norm_tag in ("a", "blockquote", "pre", "tg-emoji") and _in_stack(norm_tag):
                     continue
 
                 if norm_tag == "a":
@@ -553,33 +667,56 @@ class AIService:
                         continue
                     safe_url = url.replace('"', "%22")
                     safe_url = re.sub(r"&(?!(?:lt|gt|amp|quot|#\d+);)", "&amp;", safe_url)
-                    stack.append("a")
-                    out.append(f'<a href="{safe_url}">')
+                    open_str = f'<a href="{safe_url}">'
+                    stack.append(("a", open_str))
+                    out.append(open_str)
+                elif norm_tag == "tg-emoji":
+                    eid_m = re.search(
+                        r"""(?:emoji-id|document-id)\s*=\s*(?:"(\d+)"|'(\d+)'|(\d+))""",
+                        attrs,
+                        flags=re.IGNORECASE,
+                    )
+                    if not eid_m:
+                        continue
+                    eid = eid_m.group(1) or eid_m.group(2) or eid_m.group(3)
+                    open_str = f'<tg-emoji emoji-id="{eid}">'
+                    stack.append(("tg-emoji", open_str))
+                    out.append(open_str)
                 elif norm_tag == "blockquote":
-                    stack.append("blockquote")
-                    out.append("<blockquote expandable>" if "expandable" in attrs.lower() else "<blockquote>")
+                    open_str = "<blockquote expandable>" if "expandable" in attrs.lower() else "<blockquote>"
+                    stack.append(("blockquote", open_str))
+                    out.append(open_str)
                 elif norm_tag == "code":
                     lang_m = re.search(r'class\s*=\s*["\']?(language-[a-zA-Z0-9_+-]+)', attrs, flags=re.IGNORECASE)
-                    stack.append("code")
-                    if lang_m and "pre" in stack:
-                        out.append(f'<code class="{lang_m.group(1)}">')
+                    if lang_m and _in_stack("pre"):
+                        open_str = f'<code class="{lang_m.group(1)}">'
                     else:
-                        out.append("<code>")
+                        open_str = "<code>"
+                    stack.append(("code", open_str))
+                    out.append(open_str)
                 else:
-                    stack.append(norm_tag)
-                    out.append(f"<{norm_tag}>")
+                    open_str = f"<{norm_tag}>"
+                    stack.append((norm_tag, open_str))
+                    out.append(open_str)
             else:
-                if norm_tag not in stack:
+                if not _in_stack(norm_tag):
                     continue
+                reopen: list[tuple[str, str]] = []
                 while stack:
-                    top = stack.pop()
-                    out.append(f"</{top}>")
-                    if top == norm_tag:
+                    top_tag, top_open = stack.pop()
+                    out.append(f"</{top_tag}>")
+                    if top_tag == norm_tag:
                         break
+                    if top_tag in ("b", "i", "u", "s", "tg-spoiler", "a"):
+                        reopen.append((top_tag, top_open))
+                for r_tag, r_open in reversed(reopen):
+                    stack.append((r_tag, r_open))
+                    out.append(r_open)
 
         out.append(text[last_idx:])
         while stack:
-            out.append(f"</{stack.pop()}>")
+            top_tag, _ = stack.pop()
+            out.append(f"</{top_tag}>")
 
         return "".join(out)
 
@@ -596,6 +733,11 @@ class AIService:
         )
         plain = re.sub(r"</?[a-zA-Z0-9_-]+(?:\s+[^>]*)?>", "", no_links)
         return _html.unescape(plain).strip()
+
+    @staticmethod
+    def strip_custom_emoji_tags(text: str) -> str:
+        """Убирает обёртку <tg-emoji ...>, оставляя внутренний стандартный смайлик (для Bot API фоллбэка)."""
+        return re.sub(r"</?tg-emoji\b[^>]*>", "", text, flags=re.IGNORECASE)
 
     @classmethod
     def truncate_telegram_html(cls, text: str, max_len: int) -> str:
@@ -651,7 +793,7 @@ class AIService:
         text = re.sub(r"<\s*/\s*p\s*>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<\s*p(?:\s+[^>]*)?\s*>", "", text, flags=re.IGNORECASE)
         text = re.sub(
-            r"</?(?:div|span|h[1-6]|ul|ol|li|section|article|header|footer|font|center|mark|small|sub|sup|tg-emoji)\b[^>]*>",
+            r"</?(?:div|span|h[1-6]|ul|ol|li|section|article|header|footer|font|center|mark|small|sub|sup)\b[^>]*>",
             "",
             text,
             flags=re.IGNORECASE,
@@ -668,7 +810,8 @@ class AIService:
 
         allowed_pattern = re.compile(
             r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)\b[^>]*>"
-            r"|<a\s+href=[\"'](?:https?://|tg://user\?id=)[^\"']+[\"'][^>]*>|</a>",
+            r"|<a\s+href=[\"'](?:https?://|tg://user\?id=)[^\"']+[\"'][^>]*>|</a>"
+            r"|<tg-emoji\s+(?:emoji-id|document-id)=[\"']?\d+[\"']?[^>]*>|</tg-emoji>",
             flags=re.IGNORECASE,
         )
         preserved: list[str] = []
@@ -682,6 +825,10 @@ class AIService:
             )
             if a_match:
                 tag_str = f"<a href={a_match.group(1)}>"
+            elif re.match(r"<tg-emoji\b", tag_str, flags=re.IGNORECASE):
+                eid_m = re.search(r"(?:emoji-id|document-id)=[\"']?(\d+)[\"']?", tag_str, flags=re.IGNORECASE)
+                if eid_m:
+                    tag_str = f'<tg-emoji emoji-id="{eid_m.group(1)}">'
             elif re.match(r"<blockquote\b", tag_str, flags=re.IGNORECASE):
                 tag_str = (
                     "<blockquote expandable>"
@@ -693,8 +840,8 @@ class AIService:
             return f"\x00TAG{idx}\x00"
 
         stashed = allowed_pattern.sub(_stash, text)
-        # Убираем битые/неподдержанные <a href="..."> (у которых нет http/https)
-        stashed = re.sub(r"</?a\b[^>]*>", "", stashed, flags=re.IGNORECASE)
+        # Убираем битые/неподдержанные <a href="..."> и <tg-emoji> без валидных атрибутов
+        stashed = re.sub(r"</?(?:a|tg-emoji)\b[^>]*>", "", stashed, flags=re.IGNORECASE)
         # Оставшиеся угловые скобки (например, <int> в коде или обрывки битых тегов) безопасно экранируем
         stashed = re.sub(r"&(?!(?:lt|gt|amp|quot|#\d+);)", "&amp;", stashed)
         stashed = stashed.replace("<", "&lt;").replace(">", "&gt;")
