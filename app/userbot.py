@@ -27,6 +27,7 @@ from telethon.tl.types import (
     Message,
     MessageEntityPre,
     MessageEntitySpoiler,
+    MessageMediaWebPage,
 )
 
 # Регистрируем поддержку <tg-spoiler> и чистого <pre> для точного переноса форматирования (в обе стороны: unparse и parse)
@@ -246,12 +247,25 @@ class UserbotParser:
             try:
                 await self.client.get_entity(cid)
             except Exception:
-                ref = (s.get("username_or_link") or "").strip().lstrip("@")
-                if ref and "t.me/+" not in ref and "joinchat" not in ref:
+                raw_ref = (s.get("username_or_link") or "").strip()
+                invite_m = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([a-zA-Z0-9_-]+)", raw_ref)
+                if invite_m:
                     try:
-                        await self.client.get_entity(ref)
+                        await self.client(ImportChatInviteRequest(invite_m.group(1)))
                     except Exception:
                         pass
+                else:
+                    pub_m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([a-zA-Z0-9_]{4,32})", raw_ref)
+                    ref = pub_m.group(1) if pub_m else raw_ref.lstrip("@")
+                    if ref:
+                        try:
+                            ent = await self.client.get_entity(ref)
+                            try:
+                                await self.client(JoinChannelRequest(ent))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
 
     async def _on_authorized(self) -> None:
         me = await self.client.get_me()
@@ -599,12 +613,14 @@ class UserbotParser:
         lock_keys = [(chat_id, mid) for mid in msg_ids]
         self._processing_keys.update(lock_keys)
         try:
-            original_text = ""
+            text_parts: list[str] = []
             for m in ordered:
                 if m.message and m.message.strip():
-                    # Извлекаем текст вместе с HTML-оформлением (цитаты, жирный, код, скрытые гиперссылки)
-                    original_text = tg_html.unparse(m.message, m.entities or []).strip()
-                    break
+                    # Извлекаем весь текст вместе с HTML-оформлением (цитаты, жирный, код, <tg-emoji>, скрытые гиперссылки)
+                    part_html = tg_html.unparse(m.message, m.entities or []).strip()
+                    if part_html and part_html not in text_parts:
+                        text_parts.append(part_html)
+            original_text = "\n\n".join(text_parts).strip()
 
             # Если ссылка на сервис спрятана только в превью (или под невидимым символом), сохраняем её
             for m in ordered:
@@ -714,7 +730,9 @@ class UserbotParser:
         downloaded: list[dict] = []
 
         for m in messages:
-            if not m.media:
+            # Игнорируем превью веб-ссылок и чужих ТГ-каналов (MessageMediaWebPage),
+            # чтобы не скачивать аватарки чужих каналов или превью сайтов как медиа поста!
+            if not m.media or isinstance(m.media, MessageMediaWebPage):
                 continue
 
             media_type: str | None = None

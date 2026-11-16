@@ -57,6 +57,8 @@ class Database:
                 "filter_ads": "1",
                 "auto_publish": "0",
                 "custom_emoji_palette": "",
+                "emoji_list_bullet": "",
+                "emoji_headline": "",
                 "publisher_string_session": "",
             }
             for k, v in defaults.items():
@@ -65,37 +67,65 @@ class Database:
                     (k, v),
                 )
 
-            # Обновляем старый дефолтный промпт на современную вёрстку с заголовками, цитатами, ссылками и <tg-emoji>
+            # Обновляем старый дефолтный промпт на бережное сохранение структуры 1-в-1, списков и <tg-emoji>
             async with db.execute("SELECT value FROM settings WHERE key = 'style_prompt'") as cur:
                 row = await cur.fetchone()
                 if row and (
                     "опытный главный редактор" in row[0]
-                    or "аккуратный редактор Telegram-канала" in row[0]
+                    or "БЕРЕЖНАЯ редактура, а не тотальное переписывание" in row[0]
+                    or "шеф-редактор современного Telegram-канала" in row[0]
                 ):
                     await db.execute(
                         "UPDATE settings SET value = ? WHERE key = 'style_prompt'",
                         (DEFAULT_STYLE_PROMPT,),
                     )
 
-            # Автовосстановление списка каналов из INITIAL_SOURCES_JSON (для бесплатного облака без диска)
+            # Базовый список из 18 каналов-доноров + дополнение из INITIAL_SOURCES_JSON
+            default_sources = [
+                {"chat_id": -1003469689117, "title": "要 C 一下吗？", "username_or_link": "@pk_fns", "is_private": 0, "enabled": 1},
+                {"chat_id": -1004418840629, "title": "老王技术资讯频道", "username_or_link": "@eooce_channel", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002546853359, "title": "Никита Велс | AI", "username_or_link": "https://telegram.me/+frtm7Hh88ss1NDBh", "is_private": 1, "enabled": 1},
+                {"chat_id": -1002002176741, "title": "Бывший Скамер печатает..", "username_or_link": "https://t.me/+Akjabw9v_cI4Y2Ni", "is_private": 1, "enabled": 1},
+                {"chat_id": -1001555418015, "title": "Вайб-кодинг", "username_or_link": "@vibecoding_tg", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002824239254, "title": "AI для своих", "username_or_link": "@ai4svoi", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002331256012, "title": "Матрица", "username_or_link": "@matrix_media_1", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002270345261, "title": "Александр Бубнов [ex. ИИШНЫЙ]", "username_or_link": "@aishnyy", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002011947245, "title": "Алексей Орфеев про бизнес и контент с помощью нейросетей и автоматизации", "username_or_link": "@AlekseyOrfeev", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002966261035, "title": "Vọc VN", "username_or_link": "@vocvnchanel", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002041340502, "title": "SGX", "username_or_link": "@crypto_sgx", "is_private": 0, "enabled": 1},
+                {"chat_id": -1003799671340, "title": "выф", "username_or_link": "@wod304", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002857314478 if False else -1002857314778, "title": "НЕЙРО ПРОФИТ", "username_or_link": "@neuroprft", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002671714459, "title": "PK个人频道", "username_or_link": "@pk_oa", "is_private": 0, "enabled": 1},
+                {"chat_id": -1001966291562, "title": "КиберТопор", "username_or_link": "https://t.me/cybers", "is_private": 1, "enabled": 1},
+                {"chat_id": -1001758234692, "title": "XOR", "username_or_link": "@xor_journal", "is_private": 0, "enabled": 1},
+                {"chat_id": -1001333809979, "title": "CodeCamp", "username_or_link": "https://t.me/codecamp", "is_private": 1, "enabled": 1},
+                {"chat_id": -1001104344271, "title": "Не баг, а фича", "username_or_link": "@bugnotfeature", "is_private": 0, "enabled": 1},
+            ]
+            combined_sources = list(default_sources)
             initial_sources_raw = os.getenv("INITIAL_SOURCES_JSON", "").strip()
             if initial_sources_raw:
                 try:
                     initial_list = json.loads(initial_sources_raw)
-                    for src in initial_list:
-                        await db.execute(
-                            """
-                            INSERT OR IGNORE INTO sources (chat_id, title, username_or_link, is_private, enabled)
-                            VALUES (?, ?, ?, ?, ?)
-                            """,
-                            (
-                                int(src["chat_id"]),
-                                str(src["title"]),
-                                str(src["username_or_link"]),
-                                int(src.get("is_private", 0)),
-                                int(src.get("enabled", 1)),
-                            ),
-                        )
+                    if isinstance(initial_list, list):
+                        combined_sources.extend(initial_list)
+                except Exception:
+                    pass
+
+            for src in combined_sources:
+                try:
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO sources (chat_id, title, username_or_link, is_private, enabled)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(src["chat_id"]),
+                            str(src["title"]),
+                            str(src["username_or_link"]),
+                            int(src.get("is_private", 0)),
+                            int(src.get("enabled", 1)),
+                        ),
+                    )
                 except Exception:
                     pass
 

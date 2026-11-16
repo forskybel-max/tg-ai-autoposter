@@ -80,7 +80,13 @@ def setup_router(
         auto_pub = (await db.get_setting("auto_publish", "0")) == "1"
         sig = await db.get_setting("channel_signature", "")
         palette = await db.get_setting("custom_emoji_palette", "")
-        palette_cnt = AIService.count_custom_emojis(palette)
+        bullet_emj = await db.get_setting("emoji_list_bullet", "")
+        head_emj = await db.get_setting("emoji_headline", "")
+        palette_cnt = (
+            AIService.count_custom_emojis(palette)
+            + AIService.count_custom_emojis(bullet_emj)
+            + AIService.count_custom_emojis(head_emj)
+        )
         is_ub_auth = await userbot.is_authorized()
         ub_label = await userbot.get_account_label()
         pub_label = (
@@ -771,67 +777,143 @@ def setup_router(
             "✅ Подпись канала сохранена!", reply_markup=kb, parse_mode="HTML"
         )
 
-    # --- Фирменный набор платных анимированных эмодзи ---
+    # --- Фирменный набор платных анимированных эмодзи (по ролям: списки, заголовки, общие) ---
 
-    @router.callback_query(F.data == "menu:emoji_palette")
-    async def cb_emoji_palette_menu(call: CallbackQuery, state: FSMContext) -> None:
-        curr = await db.get_setting("custom_emoji_palette", "")
-        tags = AIService.extract_custom_emoji_tags(curr)
-        await state.set_state(AdminStates.waiting_for_emoji_palette)
+    async def _render_emoji_palette_screen(target_role: str = "all") -> tuple[str, InlineKeyboardMarkup]:
+        bullet_raw = await db.get_setting("emoji_list_bullet", "")
+        head_raw = await db.get_setting("emoji_headline", "")
+        pal_raw = await db.get_setting("custom_emoji_palette", "")
+
+        b_tags = AIService.extract_custom_emoji_tags(bullet_raw)
+        h_tags = AIService.extract_custom_emoji_tags(head_raw)
+        p_tags = AIService.extract_custom_emoji_tags(pal_raw)
+
+        b_str = f"<code>{html.escape(' '.join(b_tags))}</code>" if b_tags else "<i>из оригинала поста</i>"
+        h_str = f"<code>{html.escape(' '.join(h_tags))}</code>" if h_tags else "<i>из оригинала поста</i>"
+        p_str = f"<code>{html.escape(' '.join(p_tags))}</code>" if p_tags else "<i>не заданы</i>"
+
+        role_hints = {
+            "bullet": "👉 <b>Сейчас вы задаёте эмодзи ДЛЯ СПИСКОВ (буллет):</b> отправьте 1 платный анимированный эмодзи (например, красивую точку/маркер), который будет ставиться перед каждым пунктом списка!",
+            "headline": "👉 <b>Сейчас вы задаёте эмодзи ДЛЯ ЗАГОЛОВКОВ:</b> отправьте 1–3 платных анимированных эмодзи (например, ⚡️ 🧠 🔥) для первой строки поста!",
+            "palette": "👉 <b>Сейчас вы задаёте ОБЩИЕ эмодзи для акцентов:</b> отправьте любые любимые платные эмодзи через пробел!",
+            "all": (
+                "💡 <b>Как прикрепить свои эмодзи:</b>\n"
+                "Нажмите одну из кнопок роли ниже («🔹 Для списков», «🔥 Для заголовков», «✨ Общие») и отправьте смайлик(и),\n"
+                "<b>ИЛИ</b> отправьте всё сразу одним сообщением с подписями:\n"
+                "<code>список: 🔴</code>\n"
+                "<code>заголовок: ⚡️ 🧠</code>\n"
+                "<code>общие: 🔥 💎 🚀</code>\n"
+                "<i>(вместо обычных смайликов вставьте ваши платные анимированные Telegram Premium эмодзи!)</i>"
+            ),
+        }
+
+        text = (
+            "✨ <b>Настройка платных анимированных эмодзи по ролям</b>\n\n"
+            f"🔹 <b>Для списков (маркер пунктов):</b> {b_str}\n"
+            f"🔥 <b>Для заголовков (начало поста):</b> {h_str}\n"
+            f"✨ <b>Общие / для акцентов ({len(p_tags)} шт.):</b> {p_str}\n\n"
+            f"{role_hints.get(target_role, role_hints['all'])}"
+        )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="🗑 Очистить набор", callback_data="menu:clear_emoji_palette"
-                    )
+                        text="🔹 Задать для списков", callback_data="emoji:role:bullet"
+                    ),
+                    InlineKeyboardButton(
+                        text="🔥 Задать для заголовков", callback_data="emoji:role:headline"
+                    ),
                 ],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="menu:home")],
+                [
+                    InlineKeyboardButton(
+                        text="✨ Задать общие", callback_data="emoji:role:palette"
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑 Очистить всё", callback_data="menu:clear_emoji_palette"
+                    ),
+                ],
+                [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="menu:home")],
             ]
         )
-        tags_preview = (
-            "\n".join(f"• <code>{html.escape(t)}</code>" for t in tags[:15])
-            if tags
-            else "<i>Пока не заданы (используются только анимированные эмодзи из постов-доноров)</i>"
-        )
-        await call.message.edit_text(
-            "✨ <b>Фирменные платные анимированные эмодзи канала</b>\n\n"
-            f"Сохранено эмодзи: <b>{len(tags)} шт.</b>\n{tags_preview}\n\n"
-            "💡 <b>Как добавить:</b> просто отправьте в ответ одно сообщение со своими любимыми "
-            "анимированными Telegram Premium эмодзи (например: 🔥 ⚡ 🧠 🚀 💎).\n"
-            "Бот сам считает их <code>emoji-id</code>, и нейросеть будет автоматически украшать ими "
-            "заголовки и списки даже тех постов, где у донора анимаций не было!",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+        return text, kb
+
+    @router.callback_query(F.data == "menu:emoji_palette")
+    async def cb_emoji_palette_menu(call: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AdminStates.waiting_for_emoji_palette)
+        await state.update_data(emoji_role="all")
+        text, kb = await _render_emoji_palette_screen("all")
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await call.answer()
+
+    @router.callback_query(F.data.startswith("emoji:role:"))
+    async def cb_select_emoji_role(call: CallbackQuery, state: FSMContext) -> None:
+        role = call.data.split(":")[2]
+        await state.set_state(AdminStates.waiting_for_emoji_palette)
+        await state.update_data(emoji_role=role)
+        text, kb = await _render_emoji_palette_screen(role)
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         await call.answer()
 
     @router.callback_query(F.data == "menu:clear_emoji_palette")
     async def cb_clear_emoji_palette(call: CallbackQuery, state: FSMContext) -> None:
         await db.set_setting("custom_emoji_palette", "")
+        await db.set_setting("emoji_list_bullet", "")
+        await db.set_setting("emoji_headline", "")
         await state.clear()
-        await call.answer("Фирменный набор эмодзи очищен!")
+        await call.answer("Все фирменные эмодзи очищены!")
         text, kb = await render_main_menu_text()
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
     @router.message(AdminStates.waiting_for_emoji_palette)
     async def msg_save_emoji_palette(message: Message, state: FSMContext) -> None:
         raw_html = message.html_text or message.text or ""
-        tags = AIService.extract_custom_emoji_tags(raw_html)
-        if not tags:
+        all_tags = AIService.extract_custom_emoji_tags(raw_html)
+        if not all_tags:
             await message.answer(
                 "⚠️ В вашем сообщении не найдено платных кастомных эмодзи (<code>&lt;tg-emoji&gt;</code>).\n"
-                "Отправьте эмодзи именно из платного набора Telegram Premium (или нажмите «🔙 Назад»).",
+                "Отправьте эмодзи именно из платного набора Telegram Premium (или нажмите «🔙 Назад в меню»).",
                 parse_mode="HTML",
             )
             return
 
-        palette_str = " ".join(tags)
-        await db.set_setting("custom_emoji_palette", palette_str)
-        await state.clear()
-        text, kb = await render_main_menu_text()
+        data = await state.get_data()
+        role = data.get("emoji_role", "all")
+
+        # Проверяем, прислал ли пользователь структурированное сообщение с метками "список:", "заголовок:", "общие:"
+        saved_roles: list[str] = []
+        has_explicit_prefixes = bool(
+            re.search(r"(?:список|буллет|маркер|заголовок|шапка|общи|акцент)", raw_html, flags=re.IGNORECASE)
+        )
+        if has_explicit_prefixes:
+            for line in raw_html.splitlines():
+                line_tags = AIService.extract_custom_emoji_tags(line)
+                if not line_tags:
+                    continue
+                low = line.lower()
+                if any(k in low for k in ("список", "списков", "буллет", "маркер", "пункт")):
+                    await db.set_setting("emoji_list_bullet", line_tags[0])
+                    saved_roles.append(f"для списков ({len(line_tags[:1])} шт.)")
+                elif any(k in low for k in ("заголовок", "заголовк", "шапк", "начал")):
+                    await db.set_setting("emoji_headline", " ".join(line_tags))
+                    saved_roles.append(f"для заголовков ({len(line_tags)} шт.)")
+                else:
+                    await db.set_setting("custom_emoji_palette", " ".join(line_tags))
+                    saved_roles.append(f"общие ({len(line_tags)} шт.)")
+
+        if not saved_roles:
+            if role == "bullet":
+                await db.set_setting("emoji_list_bullet", all_tags[0])
+                saved_roles.append("для списков (буллет)")
+            elif role == "headline":
+                await db.set_setting("emoji_headline", " ".join(all_tags))
+                saved_roles.append(f"для заголовков ({len(all_tags)} шт.)")
+            else:
+                await db.set_setting("custom_emoji_palette", " ".join(all_tags))
+                saved_roles.append(f"общие ({len(all_tags)} шт.)")
+
+        text, kb = await _render_emoji_palette_screen("all")
         await message.answer(
-            f"✅ <b>Сохранено фирменных анимированных эмодзи: {len(tags)} шт.!</b>\n"
-            "Теперь ИИ будет автоматически использовать их при оформлении постов.",
+            f"✅ <b>Сохранено ({', '.join(saved_roles)})!</b>\n\n{text}",
             reply_markup=kb,
             parse_mode="HTML",
         )

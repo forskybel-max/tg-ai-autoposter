@@ -43,6 +43,8 @@ class AIService:
         signature = await self.db.get_setting("channel_signature")
         filter_ads = (await self.db.get_setting("filter_ads", "1")) == "1"
         custom_palette = (await self.db.get_setting("custom_emoji_palette", "")).strip()
+        emoji_list_bullet = (await self.db.get_setting("emoji_list_bullet", "")).strip()
+        emoji_headline = (await self.db.get_setting("emoji_headline", "")).strip()
         recent_snippets = await self.db.get_recent_post_snippets(limit=12)
 
         if not original_text or not original_text.strip():
@@ -65,16 +67,22 @@ class AIService:
         emoji_context = ""
         if orig_custom_emojis:
             emoji_context += (
-                "\nВ исходном посте есть платные анимированные Telegram Premium эмодзи — "
-                "ОБЯЗАТЕЛЬНО используй эти точные теги в заголовке и ключевых местах поста:\n"
+                "\nВ исходном посте используются платные анимированные эмодзи — "
+                "ОБЯЗАТЕЛЬНО сохрани эти же точные теги на тех же местах (в начале заголовка и в качестве маркеров пунктов списка!):\n"
                 + " ".join(orig_custom_emojis)
                 + "\n"
             )
+        if emoji_list_bullet:
+            emoji_context += (
+                f"\nФирменный анимированный эмодзи для маркированных списков (ставь его в начале каждого пункта списка вместо обычной точки «•»): {emoji_list_bullet}\n"
+            )
+        if emoji_headline:
+            emoji_context += (
+                f"\nФирменные анимированные эмодзи для начала заголовка/первого абзаца: {emoji_headline}\n"
+            )
         if custom_palette:
             emoji_context += (
-                "\nФирменный набор платных анимированных эмодзи нашего канала "
-                "(используй 1–3 подходящих по смыслу тега <tg-emoji> в заголовке и буллетах списка, "
-                "особенно если в исходнике не было своих <tg-emoji>):\n"
+                "\nДополнительные фирменные анимированные эмодзи канала (для акцентов):\n"
                 f"{custom_palette}\n"
             )
 
@@ -92,12 +100,17 @@ class AIService:
             else 'Всегда возвращай "is_rejected": false (фильтр рекламы отключен).'
         )
 
-        length_rule = (
-            "Поскольку к посту прикреплено фото/видео, длина итогового текста "
-            "НЕ должна превышать 850 символов."
-            if has_media
-            else "Длина итогового текста не должна превышать 3000 символов."
-        )
+        plain_orig_len = len(self.strip_html_tags(original_text))
+        if has_media and plain_orig_len <= 900:
+            length_rule = (
+                "Поскольку к посту прикреплено медиа и исходник компактный, длина итогового текста "
+                "не должна превышать 980 символов."
+            )
+        else:
+            length_rule = (
+                "Если исходный пост большой и подробный — ОБЯЗАТЕЛЬНО сохрани ВСЕ пункты, списки, детали и абзацы "
+                "полностью без сокращений и урезаний (до 3800 символов)."
+            )
 
         extra_block = (
             f"\nДополнительное пожелание редактора к этому варианту: {extra_instruction}\n"
@@ -106,21 +119,22 @@ class AIService:
         )
 
         tech_rules = (
-            "Обязательные правила стильной вёрстки, оформления и рубрик:\n"
-            "1. ВЫРАЗИТЕЛЬНЫЙ ЗАГОЛОВОК: Первая строка поста ВСЕГДА должна быть цепляющим жирным заголовком <b>...</b> "
-            "с тематическим эмодзи (или <tg-emoji emoji-id=\"...\"> из исходника/палитры).\n"
-            "2. СТРУКТУРА И СПИСКИ: Оформляй текст красиво и структурно! Перечисления фактов, фич или условий давай списком "
-            "через маркер «•» с жирным выделением ключевой сути (• <b>Что нового:</b> ...). Без пустой «воды» и выдуманных фактов.\n"
-            "3. ЦИТАТЫ И ПАНЧЛАЙНЫ: Ироничные ремарки (в том числе шутки в скобках), выводы, прямую речь или яркие мысли "
-            "оформляй в блок цитаты <blockquote>...</blockquote> (а длинные свёрнутые цитаты — в <blockquote expandable>...</blockquote>).\n"
-            "4. ПЛАТНЫЕ АНИМИРОВАННЫЕ ЭМОДЗИ (<tg-emoji>): Если в исходном посте или в фирменном наборе есть теги "
-            '<tg-emoji emoji-id="ЧИСЛО">эмодзи</tg-emoji> — ОБЯЗАТЕЛЬНО сохраняй их вместе с точным числовым emoji-id!\n'
-            "5. ССЫЛКИ: ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
+            "Обязательные правила бережного сохранения структуры, оформления и рубрик:\n"
+            "1. СОХРАНЯЙ СТРУКТУРУ И СПИСКИ ОРИГИНАЛА 1-В-1: НЕ перекраивай композицию поста! "
+            "Если в оригинале первый абзац начинается с жирной фразы и продолжается через тире — сохрани такой же формат. "
+            "Если в оригинале идёт подводка и обычный список из N пунктов — сохрани все N пунктов списка БЕЗ придумывания "
+            "искусственных жирных ярлыков в начале каждого пункта (НЕ пиши от себя «• <b>Последствия:</b>», если в оригинале просто список!).\n"
+            "2. ЦИТАТЫ (<blockquote>) — ТОЛЬКО ПО ОРИГИНАЛУ: оборачивай в <blockquote>...</blockquote> или <blockquote expandable>...</blockquote> "
+            "ТОЛЬКО те блоки, которые были цитатой в исходнике. НЕ оборачивай обычный финальный абзац в <blockquote> от себя!\n"
+            "3. ПЛАТНЫЕ АНИМИРОВАННЫЕ ЭМОДЗИ (<tg-emoji>): если в исходнике перед заголовком или перед каждым пунктом списка "
+            'стоят теги <tg-emoji emoji-id="ЧИСЛО">эмодзи</tg-emoji> — ОБЯЗАТЕЛЬНО сохрани именно эти теги <tg-emoji emoji-id="ЧИСЛО"> '
+            "перед каждым пунктом списка (не заменяй их на простую точку «•»!).\n"
+            "4. ССЫЛКИ: ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
             'через HTML-тег <a href="https://...">текст</a>. УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n'
-            "6. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
+            "5. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
             "к крутому платному инструменту/ИИ, промокод на бесплатную подписку, 100% скидка и т.п.) — поставь в JSON поле "
-            '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит его после заголовка автоматически!\n'
-            "7. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
+            '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит его автоматически!\n'
+            "6. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
             "<tg-spoiler>, <a href=\"...\">, <tg-emoji emoji-id=\"...\"> (никакого Markdown **текст** или > цитата)."
         )
 
@@ -137,7 +151,7 @@ class AIService:
             '  "is_rejected": false,\n'
             '  "reject_reason": "",\n'
             '  "is_freebie": false,\n'
-            '  "rewritten_text": "<b>Заголовок</b>\\n\\nСтильно оформленный текст с <blockquote>, списками, <a href=...> и <tg-emoji emoji-id=...>..."\n'
+            '  "rewritten_text": "Бережно отредактированный текст с точным сохранением структуры, списков и <tg-emoji emoji-id=...>"\n'
             "}"
         )
 
@@ -152,7 +166,11 @@ class AIService:
 
         cleaned_text = self._sanitize_html_and_links(parsed.rewritten_text)
         cleaned_text = self._restore_dropped_custom_emojis(
-            cleaned_text, original_text, custom_palette
+            cleaned_text,
+            original_text,
+            palette=custom_palette,
+            emoji_list_bullet=emoji_list_bullet,
+            emoji_headline=emoji_headline,
         )
         if parsed.is_freebie or self.has_freebie_tag(cleaned_text):
             cleaned_text = self.set_freebie_tag(cleaned_text, enabled=True)
@@ -189,26 +207,28 @@ class AIService:
                     methods = m.get("supportedGenerationMethods") or []
                     name = m.get("name", "").removeprefix("models/")
                     if "generateContent" in methods and "tts" not in name and "image" not in name and "embedding" not in name:
-                        if "flash" in name:
+                        if "hydrogen" in name or "flash" in name:
                             candidates.append(name)
-                logger.info("Доступные модели Gemini Flash на ключе: %s", candidates)
+                logger.info("Доступные модели Gemini (Hydrogen/Flash) на ключе: %s", candidates)
 
-                # Приоритет проверенным быстрым стабильным моделям без deperecated 2.5 и медленных preview
+                # Приоритет: gemini-4-hydrogen (1M контекст, быстрый), затем проверенные 3.5/3.1 Flash
                 def _model_rank(name: str) -> tuple[int, str]:
-                    if name == "gemini-3.5-flash-lite":
+                    if name == "gemini-4-hydrogen" or "hydrogen" in name:
                         return (0, name)
-                    if name == "gemini-3.1-flash-lite":
-                        return (1, name)
                     if name == "gemini-3.5-flash":
+                        return (1, name)
+                    if name == "gemini-3.5-flash-lite":
                         return (2, name)
-                    if name in ("gemini-flash-lite-latest", "gemini-flash-latest"):
+                    if name == "gemini-3.1-flash-lite":
                         return (3, name)
+                    if name in ("gemini-flash-lite-latest", "gemini-flash-latest"):
+                        return (4, name)
                     if "2.5" in name:
                         return (9, name)
                     if "preview" in name or "3.8" in name or "3.7" in name:
                         return (6, name)
                     if "lite" in name:
-                        return (4, name)
+                        return (5, name)
                     return (5, name)
 
                 candidates.sort(key=_model_rank)
@@ -238,7 +258,7 @@ class AIService:
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={self.config.ai_api_key}"
         )
-        gen_cfg: dict = {"temperature": 0.3}
+        gen_cfg: dict = {"temperature": 0.25, "maxOutputTokens": 8192}
         if use_json_schema:
             gen_cfg["responseMimeType"] = "application/json"
             gen_cfg["responseSchema"] = {
@@ -256,7 +276,9 @@ class AIService:
                     "rewritten_text",
                 ],
             }
-        if use_low_thinking and ("3.8" in model or "3.7" in model):
+        if use_low_thinking and (
+            "hydrogen" in model or "4" in model or "3.8" in model or "3.7" in model
+        ):
             gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
 
         payload = {
@@ -521,52 +543,119 @@ class AIService:
 
     @classmethod
     def _restore_dropped_custom_emojis(
-        cls, rewritten: str, original: str, palette: str = ""
+        cls,
+        rewritten: str,
+        original: str,
+        palette: str = "",
+        emoji_list_bullet: str = "",
+        emoji_headline: str = "",
     ) -> str:
         """
-        Если в исходнике (или фирменной палитре) были <tg-emoji emoji-id="ID">🔥,
-        а нейросеть при рерайте написала просто голый смайлик 🔥 без тега <tg-emoji>,
-        автоматически восстанавливает на нём платный анимированный тег!
+        1. Восстанавливает <tg-emoji emoji-id="ID">, если ИИ написал просто голый смайлик без тега.
+        2. Если в оригинале пункты списка начинались с кастомного <tg-emoji> (например, красной точки)
+           или у пользователя задан свой фирменный эмодзи для списков (emoji_list_bullet),
+           автоматически заменяет простые маркеры списков («• », «- », «▪️ ») в начале строк на этот <tg-emoji>!
+        3. Если задан фирменный эмодзи для заголовка (emoji_headline) или он был в начале оригинала,
+           гарантирует его наличие в первой строке.
         """
         if not rewritten:
             return rewritten
 
-        source_tags = cls.extract_custom_emoji_tags(original) + cls.extract_custom_emoji_tags(palette)
-        if not source_tags:
-            return rewritten
-
-        # Сопоставляем внутренний смайлик -> полный тег <tg-emoji emoji-id="...">смайлик</tg-emoji>
-        emoji_map: dict[str, str] = {}
-        for tag in source_tags:
-            m = re.match(
-                r'^(<tg-emoji\s+emoji-id="\d+">)(.+?)(</tg-emoji>)$',
-                tag,
-                flags=re.DOTALL,
-            )
-            if m:
-                inner_char = m.group(2).strip()
-                # Не заменяем обычные буквы/цифры, только эмодзи/символы
-                if inner_char and not any(ch.isalnum() for ch in inner_char) and inner_char not in emoji_map:
-                    emoji_map[inner_char] = tag
+        all_source_tags = (
+            cls.extract_custom_emoji_tags(original)
+            + cls.extract_custom_emoji_tags(emoji_list_bullet)
+            + cls.extract_custom_emoji_tags(emoji_headline)
+            + cls.extract_custom_emoji_tags(palette)
+        )
 
         out = rewritten
-        for plain_emoji, full_tag in emoji_map.items():
-            # Заменяем голый смайлик только там, где он ещё НЕ обёрнут в <tg-emoji>
-            escaped = re.escape(plain_emoji)
+
+        # 1. Определяем кастомный эмодзи-буллет для списков (приоритет: настройка пользователя -> буллет из оригинала)
+        user_bullets = cls.extract_custom_emoji_tags(emoji_list_bullet)
+        bullet_tag: str | None = user_bullets[0] if user_bullets else None
+        if not bullet_tag and original:
+            # Проверяем, есть ли в оригинале строки, начинающиеся с <tg-emoji ...>
+            line_start_tags = re.findall(
+                r"(?:^|\n)[ \t]*(?:<(?:b|strong|i|em)>)?(<tg-emoji\s+(?:emoji-id|document-id)=[\"']?\d+[\"']?\s*>.*?</tg-emoji>)",
+                original,
+                flags=re.IGNORECASE,
+            )
+            # Если какой-то <tg-emoji> стоит в начале строки хотя бы 2 раза (список!) или после него идёт текст пункта
+            if len(line_start_tags) >= 2:
+                # Берём самый частый <tg-emoji> в начале строк (обычно это маркер списка, а не заголовок)
+                counts: dict[str, int] = {}
+                for raw_t in line_start_tags:
+                    norm_list = cls.extract_custom_emoji_tags(raw_t)
+                    if norm_list:
+                        t_norm = norm_list[0]
+                        counts[t_norm] = counts.get(t_norm, 0) + 1
+                for t_norm, cnt in counts.items():
+                    if cnt >= 2:
+                        bullet_tag = t_norm
+                        break
+                if not bullet_tag and len(line_start_tags) >= 2:
+                    norm_second = cls.extract_custom_emoji_tags(line_start_tags[1])
+                    if norm_second:
+                        bullet_tag = norm_second[0]
+
+        if bullet_tag:
+            # Заменяем простые текстовые маркеры списков в начале строк на анимированный <tg-emoji>
             out = re.sub(
-                rf'(?<!">){escaped}(?!</tg-emoji>)',
-                full_tag,
+                r"(^|\n)([ \t]*)(?:•|▪|▪️|▫|▫️|🔸|🔹|—|-|\*)[ \t]+",
+                lambda m: f"{m.group(1)}{m.group(2)}{bullet_tag} ",
                 out,
             )
 
-        # Если в исходном посте были кастомные эмодзи, но в результате всё ещё 0 <tg-emoji>,
-        # аккуратно ставим первый кастомный эмодзи оригинала в начало заголовка
-        if cls.count_custom_emojis(out) == 0 and cls.extract_custom_emoji_tags(original):
-            first_custom = cls.extract_custom_emoji_tags(original)[0]
-            if out.startswith("<b>"):
-                out = f"<b>{first_custom} " + out[3:]
-            else:
-                out = f"{first_custom} {out}"
+        # 2. Сопоставляем внутренний смайлик -> полный тег <tg-emoji emoji-id="...">смайлик</tg-emoji>
+        if all_source_tags:
+            emoji_map: dict[str, str] = {}
+            for tag in all_source_tags:
+                m = re.match(
+                    r'^(<tg-emoji\s+emoji-id="\d+">)(.+?)(</tg-emoji>)$',
+                    tag,
+                    flags=re.DOTALL,
+                )
+                if m:
+                    inner_char = m.group(2).strip()
+                    # Не заменяем обычные буквы/цифры и точку • (её уже обработали выше только в начале строк)
+                    if (
+                        inner_char
+                        and inner_char not in ("•", "-", "*")
+                        and not any(ch.isalnum() for ch in inner_char)
+                        and inner_char not in emoji_map
+                    ):
+                        emoji_map[inner_char] = tag
+
+            for plain_emoji, full_tag in emoji_map.items():
+                escaped = re.escape(plain_emoji)
+                out = re.sub(
+                    rf'(?<!">){escaped}(?!</tg-emoji>)',
+                    full_tag,
+                    out,
+                )
+
+        # 3. Проверяем заголовок (первую строку): если задан emoji_headline или в первой строке оригинала был <tg-emoji>
+        first_line, sep, rest = out.partition("\n")
+        if cls.count_custom_emojis(first_line) == 0:
+            head_candidates = cls.extract_custom_emoji_tags(emoji_headline)
+            if not head_candidates and original:
+                orig_first_line = original.splitlines()[0] if original.splitlines() else ""
+                head_candidates = cls.extract_custom_emoji_tags(orig_first_line)
+            if head_candidates:
+                head_tag = head_candidates[0]
+                # Если в начале первой строки стоит обычный эмодзи — заменяем его на кастомный, иначе ставим в начало
+                first_line_clean = re.sub(
+                    r"^((?:<(?:b|strong)>)?)\s*(?:[^\w\s<]{1,3})\s*",
+                    rf"\1{head_tag} ",
+                    first_line,
+                    count=1,
+                )
+                if cls.count_custom_emojis(first_line_clean) == 0:
+                    if first_line.startswith("<b>"):
+                        first_line_clean = f"<b>{head_tag} " + first_line[3:]
+                    else:
+                        first_line_clean = f"{head_tag} {first_line}"
+                out = f"{first_line_clean}{sep}{rest}" if sep else first_line_clean
 
         return cls.balance_telegram_html(out, strip_tg_links=True)
 
