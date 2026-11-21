@@ -236,7 +236,7 @@ class Publisher:
 
         for admin_id in recipients:
             try:
-                if use_media and len(media_items) == 1 and len(full_preview_text) <= 1024:
+                if use_media and len(media_items) == 1 and AIService.visible_length(full_preview_text) <= 1024:
                     await self._send_single_media_safe(
                         chat_id=admin_id,
                         item=media_items[0],
@@ -244,8 +244,8 @@ class Publisher:
                         reply_markup=keyboard,
                     )
                 elif use_media and len(media_items) >= 1:
-                    # Для альбомов (2+ файла) или длинного текста (>1024 симв.)
-                    # сначала отправляем медиа, а следом текст с кнопками управления
+                    # Для альбомов (2+ файла) или длинного превью в предложке (>1024 видимых симв.)
+                    # сначала отправляем медиа, а следом текст с инлайн-кнопками управления
                     if len(media_items) == 1:
                         await self._send_single_media_safe(
                             chat_id=admin_id,
@@ -284,7 +284,7 @@ class Publisher:
 
     async def publish_to_channel(self, post_id: int) -> bool:
         """
-        Публикует пост в целевой канал TARGET_CHANNEL.
+        Публикует пост в целевой канал TARGET_CHANNEL всегда ОДНИМ цельным постом (без разрыва медиа и текста).
         Если подключен Premium-публикатор (основа с Telegram Premium) — публикует через него
         с сохранением всех платных анимированных эмодзи (<tg-emoji emoji-id="...">).
         Иначе (или при ошибке прав) автоматически публикует через стандартного бота.
@@ -327,30 +327,25 @@ class Publisher:
                     exc,
                 )
 
-        # 2. Публикация через стандартного бота (Bot API)
+        # 2. Публикация через стандартного бота (Bot API) — всегда ОДНИМ постом (медиа + подпись вместе)
         try:
             if not use_media:
                 await self._send_text_safe(chat_id=target, text=text)
             elif len(media_items) == 1:
                 item = media_items[0]
-                if len(text) <= 1024:
-                    await self._send_single_media_safe(
-                        chat_id=target,
-                        item=item,
-                        caption=text or None,
-                    )
-                else:
-                    # Если текст длиннее 1024 символов — отправляем медиа и следом текст
-                    await self._send_single_media_safe(
-                        chat_id=target,
-                        item=item,
-                        caption=None,
-                    )
-                    await self._send_text_safe(chat_id=target, text=text)
+                await self._send_single_media_safe(
+                    chat_id=target,
+                    item=item,
+                    caption=text or None,
+                )
             else:
-                # Публикация медиа-альбома (2–10 файлов)
+                # Публикация медиа-альбома (2–10 файлов) одним постом с подписью на первом медиа
                 bot_ready_text = AIService.strip_custom_emoji_tags(text)
-                caption_for_album = bot_ready_text if (bot_ready_text and len(bot_ready_text) <= 1024) else None
+                caption_for_album = (
+                    AIService.truncate_telegram_html(bot_ready_text, 1024)
+                    if bot_ready_text
+                    else None
+                )
                 media_group = self._build_media_group(
                     media_items, caption=caption_for_album
                 )
@@ -365,8 +360,6 @@ class Publisher:
                         await self.bot.send_media_group(chat_id=target, media=media_group_plain)
                     else:
                         raise
-                if len(bot_ready_text) > 1024:
-                    await self._send_text_safe(chat_id=target, text=text)
 
             await self.db.update_post_status(post_id, "published")
             self.cleanup_post_media(post)

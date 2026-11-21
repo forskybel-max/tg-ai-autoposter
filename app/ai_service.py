@@ -45,7 +45,8 @@ class AIService:
         custom_palette = (await self.db.get_setting("custom_emoji_palette", "")).strip()
         emoji_list_bullet = (await self.db.get_setting("emoji_list_bullet", "")).strip()
         emoji_headline = (await self.db.get_setting("emoji_headline", "")).strip()
-        recent_snippets = await self.db.get_recent_post_snippets(limit=12)
+        all_sources = await self.db.get_sources(only_enabled=False)
+        donor_titles = [str(s.get("title") or "").strip() for s in all_sources if s.get("title")]
 
         if not original_text or not original_text.strip():
             final_caption = signature.strip() if signature.strip() else ""
@@ -55,20 +56,44 @@ class AIService:
                 rewritten_text=final_caption,
             )
 
+        # 1. Предварительная очистка исходника от подписей каналов-доноров («🙂 Не баг, а фича» + их лого-<tg-emoji>)
+        #    ДО извлечения кастомных эмодзи и ДО отправки в ИИ!
+        precleaned_original = self.strip_donor_watermarks(original_text, donor_titles=donor_titles)
+        if not precleaned_original.strip():
+            return AIResult(
+                is_rejected=True,
+                reject_reason="Пост состоял только из ссылки/подписи чужого канала",
+                rewritten_text="",
+            )
+
+        # 2. Быстрая программная проверка на дубликаты по последним 80 постам (до вызова ИИ)
+        if filter_ads and not extra_instruction:
+            recent_pairs = await self.db.get_recent_posts_for_dedup(limit=80)
+            is_dup, dup_reason = self.is_programmatic_duplicate(precleaned_original, recent_pairs)
+            if is_dup:
+                return AIResult(
+                    is_rejected=True,
+                    reject_reason=dup_reason,
+                    rewritten_text="",
+                )
+
+        recent_snippets = await self.db.get_recent_post_snippets(limit=35)
         recent_context = ""
         if recent_snippets:
             formatted = "\n".join(f"- {s}" for s in recent_snippets)
             recent_context = (
-                "\nСписок недавно обработанных постов (для проверки смысловых дублей):\n"
+                "\nСписок недавно обработанных постов (ЕСЛИ новый пост про то же самое событие, "
+                "ту же новость, тот же сервис или ту же раздачу — ОБЯЗАТЕЛЬНО отклони его как дубликат "
+                'с "is_rejected": true и "reject_reason": "Смысловой дубликат уже вышедшего поста"):\n'
                 f"{formatted}\n"
             )
 
-        orig_custom_emojis = self.extract_custom_emoji_tags(original_text)
+        orig_custom_emojis = self.extract_custom_emoji_tags(precleaned_original)
         emoji_context = ""
         if orig_custom_emojis:
             emoji_context += (
                 "\nВ исходном посте используются платные анимированные эмодзи — "
-                "ОБЯЗАТЕЛЬНО сохрани эти же точные теги на тех же местах (в начале заголовка и в качестве маркеров пунктов списка!):\n"
+                "сохрани эти же точные теги на тех же местах (в начале заголовка и в качестве маркеров пунктов списка):\n"
                 + " ".join(orig_custom_emojis)
                 + "\n"
             )
@@ -87,24 +112,33 @@ class AIService:
             )
 
         ad_rule = (
-            "Если исходный пост является платной рекламой чужого канала/курса, казино, ставками, "
-            "розыгрышем за подписку на спонсоров, призывом перейти в чужой ТГ-бот/канал без полезной сути, "
-            "или почти дословным смысловым дублем того же самого события/поста без новых деталей из списка выше — верни "
-            '"is_rejected": true и укажи краткую причину в "reject_reason".\n'
-            "ВАЖНО — НЕ ОТКЛОНЯЙ полезный контент (ставь \"is_rejected\": false):\n"
-            "- обзоры, новости и анонсы новых нейросетей, ИИ-моделей, сервисов, приложений, GitHub-репозиториев и лайфхаков "
-            "(даже если в посте есть ссылка на сайт/сервис, упоминание бесплатного тарифа или бота-сервиса);\n"
-            "- полезные бесплатные раздачи (игры в Steam/Epic Games, бесплатные ИИ-инструменты, промокоды на 100% скидку, "
-            "бесплатные программы/ассеты без подписки на ТГ-спонсоров) — для них ставь \"is_rejected\": false и \"is_freebie\": true!"
+            "СТРОГИЙ ФИЛЬТР ТЕМАТИКИ, РЕКЛАМЫ И ДУБЛИКАТОВ:\n"
+            "Тематика нашего канала СТРОГО ограничена 4 направлениями:\n"
+            "1) Искусственный интеллект и нейросети (ИИ-модели, LLM, генераторы, агенты, промпты, ИИ-сервисы и исследования);\n"
+            "2) Халява по ИИ и IT (бесплатный доступ к нейросетям/подпискам/API, промокоды, полезные бесплатные тулзы и раздачи) — ставь \"is_freebie\": true;\n"
+            "3) Вайбкодинг (Vibe Coding) и разработка с ИИ (Cursor, Claude Code, Windsurf, Copilot, GitHub-репозитории, MCP, автоматизация);\n"
+            "4) Технологии — ТОЛЬКО тесно связанные или пересекающиеся с ИИ, нейросетями, вайбкодингом и разработкой.\n\n"
+            "ОБЯЗАТЕЛЬНО ОТКЛОНЯЙ ПОСТ (ставь \"is_rejected\": true и укажи причину в \"reject_reason\"), если это:\n"
+            "- ОФФТОП НЕ ПО ТЕМЕ: еда, чипсы (Lay's и т.д.), напитки, кино, сериалы, обычные игры (GTA, Dota, CS и др. без прямой связи с ИИ), "
+            "автомобили, политика, криминал, погода, бытовые новости и общие гаджеты без ИИ;\n"
+            "- ПУСТЫЕ МЕМЫ И ЩИТПОСТИНГ: картинки-приколы или шутки без полезной информационной сути по ИИ/вайбкодингу;\n"
+            "- РЕКЛАМА: реклама банков, кредиток, магазинов/маркетплейсов (например, «ЛАЧУГА» и т.п.), курсов, букмекеров, крипто-токенов, "
+            "розыгрышей за подписку или чужих Telegram-каналов/ботов;\n"
+            "- ДУБЛИКАТ: если пост рассказывает о том же самом событии, релизе, новости или халяве, что и любой из постов в списке недавно обработанных выше!"
             if filter_ads
             else 'Всегда возвращай "is_rejected": false (фильтр рекламы отключен).'
         )
 
-        plain_orig_len = len(self.strip_html_tags(original_text))
+        plain_orig_len = len(self.strip_html_tags(precleaned_original))
         if has_media and plain_orig_len <= 900:
             length_rule = (
-                "Поскольку к посту прикреплено медиа и исходник компактный, длина итогового текста "
-                "не должна превышать 980 символов."
+                "Поскольку к посту прикреплено медиа и исходник компактный, видимая длина текста "
+                "(без учета HTML-тегов) не должна превышать 950 символов, чтобы пост вышел одним цельным сообщением."
+            )
+        elif has_media:
+            length_rule = (
+                "К посту прикреплено медиа: сохрани все важные пункты и детали, но уложи видимый текст "
+                "(без учета HTML-тегов) максимум в 980 символов, чтобы медиа и текст опубликовались ОДНИМ постом, а не двумя!"
             )
         else:
             length_rule = (
@@ -119,22 +153,26 @@ class AIService:
         )
 
         tech_rules = (
-            "Обязательные правила бережного сохранения структуры, оформления и рубрик:\n"
+            "Обязательные правила бережного сохранения структуры, очистки от нативных вставок и оформления:\n"
             "1. СОХРАНЯЙ СТРУКТУРУ И СПИСКИ ОРИГИНАЛА 1-В-1: НЕ перекраивай композицию поста! "
-            "Если в оригинале первый абзац начинается с жирной фразы и продолжается через тире — сохрани такой же формат. "
             "Если в оригинале идёт подводка и обычный список из N пунктов — сохрани все N пунктов списка БЕЗ придумывания "
             "искусственных жирных ярлыков в начале каждого пункта (НЕ пиши от себя «• <b>Последствия:</b>», если в оригинале просто список!).\n"
             "2. ЦИТАТЫ (<blockquote>) — ТОЛЬКО ПО ОРИГИНАЛУ: оборачивай в <blockquote>...</blockquote> или <blockquote expandable>...</blockquote> "
-            "ТОЛЬКО те блоки, которые были цитатой в исходнике. НЕ оборачивай обычный финальный абзац в <blockquote> от себя!\n"
-            "3. ПЛАТНЫЕ АНИМИРОВАННЫЕ ЭМОДЗИ (<tg-emoji>): если в исходнике перед заголовком или перед каждым пунктом списка "
-            'стоят теги <tg-emoji emoji-id="ЧИСЛО">эмодзи</tg-emoji> — ОБЯЗАТЕЛЬНО сохрани именно эти теги <tg-emoji emoji-id="ЧИСЛО"> '
-            "перед каждым пунктом списка (не заменяй их на простую точку «•»!).\n"
-            "4. ССЫЛКИ: ОБЯЗАТЕЛЬНО СОХРАНЯЙ полезные внешние ссылки по смыслу поста (на сервисы, сайты, GitHub, раздачи, инструменты, статьи) "
-            'через HTML-тег <a href="https://...">текст</a>. УДАЛЯЙ ТОЛЬКО ссылки на чужие Telegram-каналы (t.me/...), чужие @юзернеймы и призывы подписаться.\n'
-            "5. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве (бесплатная раздача игры/программы/ресурсов, полностью бесплатный доступ "
-            "к крутому платному инструменту/ИИ, промокод на бесплатную подписку, 100% скидка и т.п.) — поставь в JSON поле "
-            '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит его автоматически!\n'
-            "6. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
+            "ТОЛЬКО те блоки, которые были цитатой в исходнике. НЕ оборачивай финальный абзац в <blockquote> от себя!\n"
+            "3. ВЫРЕЗАЙ НАТИВНУЮ РЕКЛАМУ И ПОДПИСИ КАНАЛОВ ВНУТРИ ПОСТА: если в полезном посте про ИИ/технологии автор вклеил "
+            "рекламное предложение про магазин/спонсора (например: «а для клиентов ЛАЧУГИ ничего не изменится — всё станет только лучше!») — "
+            "ПОЛНОСТЬЮ УДАЛИ это рекламное предложение и ссылку на магазин! Также всегда удаляй названия каналов-доноров в конце текста "
+            "(«🙂 Не баг, а фича», «КиберТопор», «Бэкдор» и их смайлик-логотип перед названием).\n"
+            "4. ВЫРЕЗАЙ ОБЩЕНИЕ АВТОРА С АУДИТОРИЕЙ: полностью удаляй фразы автора донора, обращённые к его подписчикам: "
+            "выпрашивание реакций и лайков («50 реакций и я делаю подборку с халявой», «Накидайте 🔥», «Пишите в комментах»), "
+            "обещания («Завтра сделаю разбор», «Как я писал вчера»).\n"
+            "5. ПЛАТНЫЕ АНИМИРОВАННЫЕ ЭМОДЗИ (<tg-emoji>): сохраняй смысловые теги <tg-emoji emoji-id=\"ЧИСЛО\">эмодзи</tg-emoji> "
+            "перед заголовком и перед каждым пунктом списка (но НЕ сохраняй <tg-emoji>, который стоял рядом с названием чужого канала-донора!).\n"
+            "6. ССЫЛКИ: сохраняй полезные внешние ссылки на ИИ-сервисы, GitHub, нейронки, инструменты и статьи через "
+            '<a href="https://...">текст</a>. Удаляй ссылки на магазины-спонсоры и чужие Telegram-каналы.\n'
+            "7. РУБРИКА ХАЛЯВА: если в посте речь идет о халяве по теме ИИ/IT — поставь в JSON поле "
+            '"is_freebie": true (иначе false). Сам хэштег #халява внутрь текста НЕ пиши — система добавит его после заголовка автоматически!\n'
+            "8. Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <blockquote>, <blockquote expandable>, "
             "<tg-spoiler>, <a href=\"...\">, <tg-emoji emoji-id=\"...\"> (никакого Markdown **текст** или > цитата)."
         )
 
@@ -151,23 +189,25 @@ class AIService:
             '  "is_rejected": false,\n'
             '  "reject_reason": "",\n'
             '  "is_freebie": false,\n'
-            '  "rewritten_text": "Бережно отредактированный текст с точным сохранением структуры, списков и <tg-emoji emoji-id=...>"\n'
+            '  "rewritten_text": "Бережно отредактированный текст без подписей доноров, без нативной рекламы и без выпрашивания реакций"\n'
             "}"
         )
 
         raw_response = await self._call_llm(
             system_prompt=system_prompt,
-            user_text=f"Исходный текст поста (с HTML-разметкой оригинала):\n\n{original_text}",
+            user_text=f"Исходный текст поста (с HTML-разметкой оригинала):\n\n{precleaned_original}",
         )
 
-        parsed = self._parse_json_response(raw_response, fallback_text=original_text)
+        parsed = self._parse_json_response(raw_response, fallback_text=precleaned_original)
         if parsed.is_rejected:
             return parsed
 
-        cleaned_text = self._sanitize_html_and_links(parsed.rewritten_text)
+        cleaned_text = self.strip_donor_watermarks(parsed.rewritten_text, donor_titles=donor_titles)
+        cleaned_text = self._sanitize_html_and_links(cleaned_text)
+        cleaned_text = self.strip_donor_watermarks(cleaned_text, donor_titles=donor_titles)
         cleaned_text = self._restore_dropped_custom_emojis(
             cleaned_text,
-            original_text,
+            precleaned_original,
             palette=custom_palette,
             emoji_list_bullet=emoji_list_bullet,
             emoji_headline=emoji_headline,
@@ -311,18 +351,33 @@ class AIService:
             return "\n".join(texts).strip()
 
     async def _call_gemini_native(self, system_prompt: str, user_text: str) -> str:
-        """Вызов нативного REST API Google Gemini с автоподбором быстрой модели при таймауте."""
+        """
+        Вызов нативного REST API Google Gemini.
+        Всегда пробует основную модель (self.config.ai_model, например gemini-4-hydrogen) первой
+        с быстрым повтором при временном 503, и НЕ перезаписывает self.config.ai_model при разовом фоллбэке!
+        """
         proxy = self._resolve_proxy()
         primary_model = self.config.ai_model.removeprefix("models/")
 
         async with aiohttp.ClientSession() as session:
             try:
                 return await self._call_gemini_single(
-                    session, primary_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=25.0
+                    session, primary_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=28.0
                 )
             except (asyncio.TimeoutError, Exception) as first_err:
-                logger.warning("Первичная модель %s не ответила быстро (%s: %s), ищем резервную Flash-модель...", primary_model, type(first_err).__name__, first_err)
                 err_lower = str(first_err).lower()
+                # Если временный всплеск нагрузки HTTP 503 на основной модели — ждём 1.5 сек и пробуем её ещё раз
+                if "503" in err_lower or "unavailable" in err_lower or "high demand" in err_lower:
+                    await asyncio.sleep(1.5)
+                    try:
+                        return await self._call_gemini_single(
+                            session, primary_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=28.0
+                        )
+                    except Exception as retry_err:
+                        first_err = retry_err
+                        err_lower = str(first_err).lower()
+
+                logger.warning("Первичная модель %s временно недоступна (%s: %s), используем резервную модель на этот запрос...", primary_model, type(first_err).__name__, first_err)
                 # Если ошибка 400 из-за thinkingConfig или responseSchema — пробуем ту же модель с упрощенным config
                 if "thinking" in err_lower or "schema" in err_lower or "mime" in err_lower:
                     try:
@@ -338,22 +393,16 @@ class AIService:
                     if fb_model == primary_model or "2.5" in fb_model:
                         continue
                     try:
-                        res = await self._call_gemini_single(
+                        return await self._call_gemini_single(
                             session, fb_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=25.0
                         )
-                        logger.info("Переключаем рабочую модель по умолчанию на быструю: %s", fb_model)
-                        self.config.ai_model = fb_model
-                        return res
                     except Exception as fb_err:
                         fb_lower = str(fb_err).lower()
                         if "schema" in fb_lower or "mime" in fb_lower:
                             try:
-                                res = await self._call_gemini_single(
+                                return await self._call_gemini_single(
                                     session, fb_model, system_prompt, user_text, proxy, use_low_thinking=False, use_json_schema=False, timeout_sec=25.0
                                 )
-                                logger.info("Переключаем рабочую модель по умолчанию на быструю: %s", fb_model)
-                                self.config.ai_model = fb_model
-                                return res
                             except Exception as fb_err2:
                                 fb_err = fb_err2
                         logger.warning("Резервная модель %s не сработала: %s: %s", fb_model, type(fb_err).__name__, fb_err)
@@ -829,13 +878,135 @@ class AIService:
         return re.sub(r"</?tg-emoji\b[^>]*>", "", text, flags=re.IGNORECASE)
 
     @classmethod
+    def visible_length(cls, text: str) -> int:
+        """Возвращает видимую длину текста в Telegram (без HTML-тегов)."""
+        if not text:
+            return 0
+        import html as _html
+
+        plain = re.sub(r"</?[a-zA-Z0-9_-]+(?:\s+[^>]*)?>", "", text)
+        return len(_html.unescape(plain))
+
+    @classmethod
+    def strip_donor_watermarks(
+        cls, text: str, donor_titles: list[str] | None = None
+    ) -> str:
+        """
+        Вырезает:
+        1) Подписи каналов-доноров («🙂 Не баг, а фича», «КиберТопор», «Бэкдор» и др.)
+           вместе с предшествующим им смайликом / <tg-emoji> и ссылкой на t.me/...;
+        2) Выпрашивание реакций и общение автора донора с аудиторией («50 реакций и я делаю подборку...»).
+        """
+        if not text:
+            return ""
+
+        out = text
+
+        # 1. Удаляем связку: (опциональный <tg-emoji> или смайлик/тире) + ссылка <a href="t.me/...">Название канала</a>
+        out = re.sub(
+            r'(?:[ \t]*<tg-emoji\b[^>]*>[^<]*?</tg-emoji>|[ \t]*[🙂😉😎🔥⚡️👉👇📌•|—\-~])*'
+            r'[ \t]*<a\s+href=["\'](?:https?://)?(?:t\.me|telegram\.me)/[^"\']*["\'][^>]*>[^<]*?</a>',
+            "",
+            out,
+            flags=re.IGNORECASE,
+        )
+
+        # 2. Удаляем известные названия каналов-доноров (в конце поста или отдельной строкой) вместе со смайликом перед ними
+        known_donors = {
+            "Не баг, а фича",
+            "КиберТопор",
+            "Бэкдор",
+            "Вайб-кодинг",
+            "XOR",
+            "CodeCamp",
+            "Матрица",
+            "AI для своих",
+            "НЕЙРО ПРОФИТ",
+            "Никита Велс | AI",
+            "Никита Велс",
+            "Бывший Скамер печатает..",
+            "Бывший Скамер печатает",
+            "Александр Бубнов [ex. ИИШНЫЙ]",
+            "Александр Бубнов",
+            "ИИШНЫЙ",
+            "SGX",
+            "выф",
+        }
+        if donor_titles:
+            for dt in donor_titles:
+                if dt and len(dt.strip()) >= 3:
+                    known_donors.add(dt.strip())
+
+        for title in sorted(known_donors, key=len, reverse=True):
+            esc_title = re.escape(title)
+            # В конце текста или строки: (<tg-emoji>... или любой смайлик) + Название донора в конце поста
+            out = re.sub(
+                rf"(?:[ \t\n]*(?:<tg-emoji\b[^>]*>[^<]*?</tg-emoji>|[^\w\s<>\"'.,!?;:(){{\}}\[\]]+))?[ \t]*(?:<(?:b|strong|i|em)>)?{esc_title}(?:</(?:b|strong|i|em)>)?[ \t.!]*$",
+                "",
+                out,
+                flags=re.IGNORECASE,
+            )
+
+        # 3. Удаляем выпрашивание реакций/комментариев и обещания автора чужого канала
+        reaction_patterns = [
+            r"[^\n.!?]*\b\d+\s*(?:реакци[йяи]|лайк(?:ов|а)?|огоньк(?:ов|а)?|буст(?:ов|а)?)\s+и\s+(?:я|мы)\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\b(?:набер[её]м|накидайте|ставьте|жду)\s+\d*\s*(?:реакци[йяи]|лайк(?:ов|а)?|огоньк(?:ов|а)?|🔥|❤️|👍)[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bпишите\s+в\s+комментар(?:иях|ии)\b[^\n.!?]*[.!?]?",
+        ]
+        for pat in reaction_patterns:
+            out = re.sub(pat, "", out, flags=re.IGNORECASE)
+
+        out = "\n".join(line.rstrip() for line in out.splitlines())
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out.strip()
+
+    @classmethod
+    def is_programmatic_duplicate(
+        cls, candidate_text: str, recent_pairs: list[tuple[str, str]]
+    ) -> tuple[bool, str]:
+        """Быстрая проверка на дубликаты по словам и символьным 4-граммам против последних 80 постов."""
+        def _tokenize(raw: str) -> tuple[set[str], set[str]]:
+            plain = cls.strip_html_tags(raw).lower()
+            plain = re.sub(r"https?://\S+", "", plain)
+            words = {w for w in re.findall(r"[a-zа-яё0-9]{3,}", plain) if len(w) >= 3}
+            compact = re.sub(r"[^a-zа-яё0-9]", "", plain)
+            ngrams = {compact[i : i + 4] for i in range(max(0, len(compact) - 3))}
+            return words, ngrams
+
+        cand_words, cand_ngrams = _tokenize(candidate_text)
+        if len(cand_words) < 5 and len(cand_ngrams) < 15:
+            return False, ""
+
+        for orig_prev, rew_prev in recent_pairs:
+            for prev in (orig_prev, rew_prev):
+                if not prev:
+                    continue
+                p_words, p_ngrams = _tokenize(prev)
+                if len(p_words) >= 5 and len(cand_words) >= 5:
+                    inter_w = len(cand_words & p_words)
+                    union_w = len(cand_words | p_words)
+                    min_w = min(len(cand_words), len(p_words))
+                    if union_w > 0 and (inter_w / union_w >= 0.58 or (min_w >= 8 and inter_w / min_w >= 0.78)):
+                        return True, "Программный фильтр: дубликат уже обработанного поста"
+                if len(p_ngrams) >= 15 and len(cand_ngrams) >= 15:
+                    inter_n = len(cand_ngrams & p_ngrams)
+                    union_n = len(cand_ngrams | p_ngrams)
+                    if union_n > 0 and (inter_n / union_n >= 0.56):
+                        return True, "Программный фильтр: текстовый дубликат уже обработанного поста"
+
+        return False, ""
+
+    @classmethod
     def truncate_telegram_html(cls, text: str, max_len: int) -> str:
-        """Обрезает HTML-текст до max_len символов, не ломая теги и сущности."""
+        """
+        Обрезает HTML-текст так, чтобы его ВИДИМАЯ длина (без учёта HTML-тегов <tg-emoji>, <a> и др.)
+        не превышала max_len символов, не ломая теги и сущности.
+        """
         balanced = cls.balance_telegram_html(text)
-        if len(balanced) <= max_len:
+        if cls.visible_length(balanced) <= max_len:
             return balanced
 
-        limit = max(0, max_len - 48)
+        limit = len(balanced) - 32
         while limit > 0:
             chunk = balanced[:limit]
             # Не режем внутри незакрытого тега '<...' или HTML-сущности '&...;'
@@ -849,9 +1020,11 @@ class AIService:
                 chunk = chunk[:amp]
 
             candidate = cls.balance_telegram_html(chunk.rstrip() + "...")
-            if len(candidate) <= max_len:
+            vis_len = cls.visible_length(candidate)
+            if vis_len <= max_len:
                 return candidate
-            limit -= max(20, len(candidate) - max_len + 16)
+            step = max(24, (vis_len - max_len) + 16)
+            limit -= step
 
         return cls.strip_html_tags(balanced)[:max_len]
 

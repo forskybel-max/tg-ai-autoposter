@@ -114,6 +114,9 @@ class UserbotParser:
         self._handled_order: deque[tuple[int, int]] = deque()
         self._handled_msg_ids: set[tuple[int, int]] = set()
         self._pending_groups: set[tuple[int, int]] = set()
+        self._handled_group_ids: set[tuple[int, int]] = set()
+        self._group_buffers: dict[tuple[int, int], dict[int, Message]] = {}
+        self._ai_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
 
     def export_string_session(self) -> str:
         """Экспортирует текущую сессию в строку TG_STRING_SESSION для облачного хостинга."""
@@ -294,65 +297,92 @@ class UserbotParser:
         self.enabled_chats = {int(s["chat_id"]) for s in sources}
         logger.info("Активных каналов-доноров на мониторинге: %d", len(self.enabled_chats))
 
+    async def _get_source_messages(self, chat_id: int, limit: int = 15) -> list[Message]:
+        """Надёжно получает последние сообщения канала (включая приватные и t.me/ ссылки)."""
+        try:
+            res = await self.client.get_messages(chat_id, limit=limit)
+            return list(res or [])
+        except ValueError:
+            src = await self.db.get_source(chat_id)
+            raw_ref = (src.get("username_or_link") or "").strip() if src else ""
+            if raw_ref:
+                pub_m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([a-zA-Z0-9_]{4,32})", raw_ref)
+                if pub_m and "joinchat" not in raw_ref:
+                    entity = await self.client.get_entity(pub_m.group(1))
+                    res = await self.client.get_messages(entity, limit=limit)
+                    return list(res or [])
+                elif not raw_ref.startswith("http") and "t.me/+" not in raw_ref:
+                    entity = await self.client.get_entity(raw_ref.lstrip("@"))
+                    res = await self.client.get_messages(entity, limit=limit)
+                    return list(res or [])
+            # Для закрытых каналов по инвайт-ссылке прогреваем диалоги
+            await self.client.get_dialogs(limit=150)
+            res = await self.client.get_messages(chat_id, limit=limit)
+            return list(res or [])
+
     async def _delayed_group_fallback(self, chat_id: int, grouped_id: int) -> None:
         """
-        Страховка от известного бага Telethon events.Album, когда одиночные посты с grouped_id
-        или разделённые по DC альбомы отбрасываются обработчиком Album.filter.
+        Единый сборщик медиа-альбомов (grouped_id) с дебаунсом 3.5 сек.
+        Исключает разрыв одного альбома на 2 разных поста, когда фотографии/видео
+        доходят с разницей в 1–2 секунды.
         """
         gkey = (chat_id, grouped_id)
         try:
-            await asyncio.sleep(4.0)
-            if not self.client.is_connected():
+            await asyncio.sleep(3.5)
+            if not self.client.is_connected() or gkey in self._handled_group_ids:
                 return
-            msgs = await self.client.get_messages(chat_id, limit=12)
-            group_msgs = [
-                m
-                for m in reversed(msgs)
-                if isinstance(m, Message) and m.grouped_id == grouped_id and (m.message or m.media)
-            ]
+
+            buffered = dict(self._group_buffers.get(gkey) or {})
+            try:
+                msgs = await self._get_source_messages(chat_id, limit=16)
+                for m in msgs:
+                    if isinstance(m, Message) and m.grouped_id == grouped_id and (m.message or m.media):
+                        buffered[m.id] = m
+            except Exception:
+                pass
+
+            group_msgs = sorted(buffered.values(), key=lambda m: m.id)
             if not group_msgs:
                 return
             ids = [m.id for m in group_msgs]
-            if any((chat_id, mid) in self._handled_msg_ids or (chat_id, mid) in self._processing_keys for mid in ids):
+            if gkey in self._handled_group_ids or any(
+                (chat_id, mid) in self._handled_msg_ids or (chat_id, mid) in self._processing_keys
+                for mid in ids
+            ):
                 return
             if await self.db.are_any_posts_processed(chat_id, ids):
+                self._handled_group_ids.add(gkey)
                 self._remember_handled(chat_id, ids)
                 return
-            logger.info("Резервная сборка группы/альбома (msg_id=%s, grouped_id=%s) в чате %s", ids[0], grouped_id, chat_id)
+
+            self._handled_group_ids.add(gkey)
+            logger.info("Собран медиа-альбом (msg_id=%s, файлов=%d, grouped_id=%s) в чате %s", ids[0], len(group_msgs), grouped_id, chat_id)
             await self._handle_messages(chat_id, group_msgs)
         except Exception as exc:
-            logger.warning("Ошибка резервной сборки grouped_id=%s в %s: %s", grouped_id, chat_id, exc)
+            logger.warning("Ошибка сборки альбома grouped_id=%s в %s: %s", grouped_id, chat_id, exc)
         finally:
             self._pending_groups.discard(gkey)
+            self._group_buffers.pop(gkey, None)
 
     async def _catchup_sync_loop(self) -> None:
         """
-        Резервный периодический опрос каналов-доноров (раз в 90 сек).
-        Гарантирует, что ни один пост не потеряется из-за троттлинга пассивных
-        channel-апдейтов Telegram, сетевых сбоев (Bad Gateway) или короткого рестарта.
+        Резервный периодический опрос всех каналов-доноров (раз в 75 сек).
+        Гарантирует, что ни один пост не потеряется при высокой активности, троттлинге
+        пассивных апдейтов Telegram или временных сетевых задержках.
         """
-        await asyncio.sleep(25)
+        await asyncio.sleep(20)
         while True:
             try:
                 sources = await self.db.get_sources(only_enabled=True)
                 now = datetime.now(timezone.utc)
-                cutoff = max(self._sync_after, now - timedelta(hours=2))
+                cutoff = max(self._sync_after, now - timedelta(hours=3))
 
                 for s in sources:
                     chat_id = int(s["chat_id"])
                     if chat_id not in self.enabled_chats:
                         continue
                     try:
-                        try:
-                            msgs = await self.client.get_messages(chat_id, limit=8)
-                        except ValueError:
-                            ref = (s.get("username_or_link") or "").strip().lstrip("@")
-                            if ref and "t.me/+" not in ref and "joinchat" not in ref:
-                                entity = await self.client.get_entity(ref)
-                                msgs = await self.client.get_messages(entity, limit=8)
-                            else:
-                                continue
-
+                        msgs = await self._get_source_messages(chat_id, limit=15)
                         if not msgs:
                             continue
 
@@ -382,12 +412,19 @@ class UserbotParser:
                                 ordered_posts.append([m])
 
                         for post_msgs in ordered_posts:
-                            # Даём 8 секунд свежим сообщениям, чтобы сработал мгновенный realtime-хендлер и собрался весь альбом
+                            # Даём 8 секунд свежим сообщениям, чтобы сработал realtime-хендлер и собрался весь альбом
                             newest_dt = max(
                                 (pm.date if pm.date.tzinfo else pm.date.replace(tzinfo=timezone.utc))
                                 for pm in post_msgs
                             )
                             if (now - newest_dt).total_seconds() < 8:
+                                continue
+
+                            first_gid = post_msgs[0].grouped_id
+                            if first_gid is not None and (
+                                (chat_id, first_gid) in self._handled_group_ids
+                                or (chat_id, first_gid) in self._pending_groups
+                            ):
                                 continue
 
                             ids = [pm.id for pm in post_msgs]
@@ -398,28 +435,32 @@ class UserbotParser:
                             ):
                                 continue
                             if await self.db.are_any_posts_processed(chat_id, ids):
+                                if first_gid is not None:
+                                    self._handled_group_ids.add((chat_id, first_gid))
                                 self._remember_handled(chat_id, ids)
                                 continue
 
+                            if first_gid is not None:
+                                self._handled_group_ids.add((chat_id, first_gid))
                             logger.info(
-                                "Catch-up sync обнаружил пропущенный пост в '%s' (msg_id=%s)",
+                                "Catch-up sync подхватил пост в '%s' (msg_id=%s)",
                                 s["title"],
                                 ids[0],
                             )
-                            await self._handle_messages(chat_id, post_msgs)
+                            asyncio.create_task(self._handle_messages(chat_id, post_msgs))
                     except FloodWaitError as fw:
                         logger.warning("FloodWait при catch-up sync (%s сек)", fw.seconds)
                         await asyncio.sleep(min(fw.seconds + 2, 60))
                     except Exception as exc:
                         logger.warning("Ошибка catch-up sync для %s (%s): %s", s["title"], chat_id, exc)
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.35)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 logger.exception("Сбой в цикле catch-up sync: %s", exc)
 
-            await asyncio.sleep(90)
+            await asyncio.sleep(75)
 
     def _register_handlers(self) -> None:
         @self.client.on(events.NewMessage())
@@ -433,20 +474,14 @@ class UserbotParser:
                 return
             if event.message.grouped_id is not None:
                 gkey = (chat_id, event.message.grouped_id)
+                if gkey in self._handled_group_ids:
+                    return
+                self._group_buffers.setdefault(gkey, {})[event.message.id] = event.message
                 if gkey not in self._pending_groups:
                     self._pending_groups.add(gkey)
                     asyncio.create_task(self._delayed_group_fallback(chat_id, event.message.grouped_id))
                 return
-            await self._handle_messages(chat_id, [event.message])
-
-        @self.client.on(events.Album())
-        async def on_album(event: events.Album.Event) -> None:
-            chat_id = event.chat_id
-            if chat_id is None and event.messages and event.messages[0].peer_id:
-                chat_id = utils.get_peer_id(event.messages[0].peer_id)
-            if chat_id not in self.enabled_chats:
-                return
-            await self._handle_messages(chat_id, list(event.messages))
+            asyncio.create_task(self._handle_messages(chat_id, [event.message]))
 
     async def join_and_register_channel(self, raw_input: str) -> tuple[bool, str]:
         """
@@ -549,15 +584,7 @@ class UserbotParser:
             return False, "Сначала авторизуйте Userbot в главном меню!"
 
         try:
-            try:
-                messages = await self.client.get_messages(chat_id, limit=10)
-            except ValueError:
-                src = await self.db.get_source(chat_id)
-                ref = (src.get("username_or_link") or "").strip().lstrip("@") if src else ""
-                if not ref:
-                    raise
-                entity = await self.client.get_entity(ref)
-                messages = await self.client.get_messages(entity, limit=10)
+            messages = await self._get_source_messages(chat_id, limit=12)
             if not messages:
                 return False, "В канале пока нет доступных сообщений."
 
@@ -598,6 +625,7 @@ class UserbotParser:
         msg_ids = [m.id for m in ordered]
         primary_msg = ordered[0]
         msg_id = primary_msg.id
+        first_gid = primary_msg.grouped_id
 
         if not force:
             if any(
@@ -608,10 +636,14 @@ class UserbotParser:
                 return
             if await self.db.are_any_posts_processed(chat_id, msg_ids):
                 self._remember_handled(chat_id, msg_ids)
+                if first_gid is not None:
+                    self._handled_group_ids.add((chat_id, first_gid))
                 return
 
         lock_keys = [(chat_id, mid) for mid in msg_ids]
         self._processing_keys.update(lock_keys)
+        if first_gid is not None:
+            self._handled_group_ids.add((chat_id, first_gid))
         try:
             text_parts: list[str] = []
             for m in ordered:
@@ -646,71 +678,90 @@ class UserbotParser:
                 self._remember_handled(chat_id, msg_ids)
                 return
 
-            logger.info(
-                "Новый пост из '%s' (msg_id=%s, медиа=%d шт.). Отправляем в ИИ...",
-                source_title,
-                msg_id,
-                len(media_items),
-            )
+            # Очередь обработки ИИ (Semaphore(1)):
+            # 1) Ни один пост не теряется при всплеске активности в 19 каналах;
+            # 2) Одновременные репосты одной и той же новости в разных каналах обрабатываются строго по очереди,
+            #    поэтому второй пост сразу видит первый в БД и отсекается как дубликат!
+            async with self._ai_semaphore:
+                if not force and await self.db.are_any_posts_processed(chat_id, msg_ids):
+                    self._remember_handled(chat_id, msg_ids)
+                    return
 
-            try:
-                ai_result = await self.ai.process_post(
-                    original_text=original_text,
-                    has_media=len(media_items) > 0,
-                )
-            except Exception as exc:
-                logger.exception("Сбой при обращении к ИИ: %s", exc)
-                import html as _html
-                err_desc = f"{type(exc).__name__}: {exc}".strip(": ")
-                recipients = [target_admin_id] if target_admin_id else self.config.admin_ids
-                for adm_id in recipients:
-                    try:
-                        await self.publisher.bot.send_message(
-                            chat_id=adm_id,
-                            text=(
-                                f"⚠️ <b>Пост из «{_html.escape(source_title)}» перехвачен, "
-                                f"но нейросеть вернула ошибку:</b>\n"
-                                f"<code>{_html.escape(err_desc[:600])}</code>"
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-                return
-
-            if ai_result.is_rejected and not force:
                 logger.info(
-                    "Пост %s из '%s' отфильтрован ИИ. Причина: %s",
-                    msg_id,
+                    "Новый пост из '%s' (msg_id=%s, медиа=%d шт.). Отправляем в ИИ...",
                     source_title,
-                    ai_result.reject_reason,
+                    msg_id,
+                    len(media_items),
                 )
+
+                ai_result = None
+                last_exc: Exception | None = None
+                for attempt in range(2):
+                    try:
+                        ai_result = await self.ai.process_post(
+                            original_text=original_text,
+                            has_media=len(media_items) > 0,
+                        )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt == 0:
+                            logger.warning("Повтор обращения к ИИ через 2.5 сек для поста %s из '%s': %s", msg_id, source_title, exc)
+                            await asyncio.sleep(2.5)
+
+                if ai_result is None:
+                    logger.exception("Сбой при обращении к ИИ: %s", last_exc)
+                    import html as _html
+                    err_desc = f"{type(last_exc).__name__}: {last_exc}".strip(": ")
+                    recipients = [target_admin_id] if target_admin_id else self.config.admin_ids
+                    for adm_id in recipients:
+                        try:
+                            await self.publisher.bot.send_message(
+                                chat_id=adm_id,
+                                text=(
+                                    f"⚠️ <b>Пост из «{_html.escape(source_title)}» перехвачен, "
+                                    f"но нейросеть вернула ошибку:</b>\n"
+                                    f"<code>{_html.escape(err_desc[:600])}</code>"
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            pass
+                    return
+
+                if ai_result.is_rejected and not force:
+                    logger.info(
+                        "Пост %s из '%s' отфильтрован ИИ. Причина: %s",
+                        msg_id,
+                        source_title,
+                        ai_result.reject_reason,
+                    )
+                    post_id = await self.db.create_post(
+                        source_chat_id=chat_id,
+                        source_msg_id=msg_id,
+                        source_title=source_title,
+                        original_text=original_text,
+                        rewritten_text="",
+                        media_items=media_items,
+                        status="filtered_ad",
+                    )
+                    post_data = await self.db.get_post(post_id)
+                    if post_data:
+                        self.publisher.cleanup_post_media(post_data)
+                    self._remember_handled(chat_id, msg_ids)
+                    return
+
+                rewritten = ai_result.rewritten_text or original_text
                 post_id = await self.db.create_post(
                     source_chat_id=chat_id,
                     source_msg_id=msg_id,
                     source_title=source_title,
                     original_text=original_text,
-                    rewritten_text="",
+                    rewritten_text=rewritten,
                     media_items=media_items,
-                    status="filtered_ad",
+                    status="pending",
                 )
-                post_data = await self.db.get_post(post_id)
-                if post_data:
-                    self.publisher.cleanup_post_media(post_data)
                 self._remember_handled(chat_id, msg_ids)
-                return
-
-            rewritten = ai_result.rewritten_text or original_text
-            post_id = await self.db.create_post(
-                source_chat_id=chat_id,
-                source_msg_id=msg_id,
-                source_title=source_title,
-                original_text=original_text,
-                rewritten_text=rewritten,
-                media_items=media_items,
-                status="pending",
-            )
-            self._remember_handled(chat_id, msg_ids)
 
             auto_publish = (await self.db.get_setting("auto_publish", "0")) == "1"
             if auto_publish and not force:
@@ -1033,7 +1084,7 @@ class PremiumPublisherClient:
         media_items: list[dict],
         use_media: bool,
     ) -> bool:
-        """Публикует пост в целевой канал через аккаунт с Telegram Premium."""
+        """Публикует пост в целевой канал через аккаунт с Telegram Premium всегда ОДНИМ постом."""
         if not await self.is_authorized():
             return False
 
@@ -1044,15 +1095,11 @@ class PremiumPublisherClient:
             await self._send_html_text(entity, text)
         elif len(media_items) == 1:
             item = media_items[0]
-            if len(text) <= 1024:
-                await self._send_single_media(entity, item, caption=text or None)
-            else:
-                await self._send_single_media(entity, item, caption=None)
-                await self._send_html_text(entity, text)
+            await self._send_single_media(entity, item, caption=text or None)
         else:
             caption_for_album = (
                 AIService.truncate_telegram_html(text, 1024)
-                if (text and len(text) <= 1024)
+                if text
                 else None
             )
             files = [m["path"] for m in media_items[:10]]
@@ -1063,6 +1110,4 @@ class PremiumPublisherClient:
                 parse_mode="html" if caption_for_album else None,
                 supports_streaming=True,
             )
-            if len(text) > 1024:
-                await self._send_html_text(entity, text)
         return True

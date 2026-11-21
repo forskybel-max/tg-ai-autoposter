@@ -67,21 +67,23 @@ class Database:
                     (k, v),
                 )
 
-            # Обновляем старый дефолтный промпт на бережное сохранение структуры 1-в-1, списков и <tg-emoji>
+            # Обновляем старый дефолтный промпт на бережное сохранение структуры 1-в-1, фильтр тематики и удаление подписей доноров
             async with db.execute("SELECT value FROM settings WHERE key = 'style_prompt'") as cur:
                 row = await cur.fetchone()
                 if row and (
                     "опытный главный редактор" in row[0]
                     or "БЕРЕЖНАЯ редактура, а не тотальное переписывание" in row[0]
                     or "шеф-редактор современного Telegram-канала" in row[0]
+                    or "СТРОГО СОХРАНЯЯ оригинальную структуру, абзацы, списки и форматирование исходного поста" in row[0]
                 ):
                     await db.execute(
                         "UPDATE settings SET value = ? WHERE key = 'style_prompt'",
                         (DEFAULT_STYLE_PROMPT,),
                     )
 
-            # Базовый список из 18 каналов-доноров + дополнение из INITIAL_SOURCES_JSON
+            # Базовый список из 19 каналов-доноров + дополнение из INITIAL_SOURCES_JSON
             default_sources = [
+                {"chat_id": -1001319248631, "title": "Бэкдор", "username_or_link": "@whackdoor", "is_private": 0, "enabled": 1},
                 {"chat_id": -1003469689117, "title": "要 C 一下吗？", "username_or_link": "@pk_fns", "is_private": 0, "enabled": 1},
                 {"chat_id": -1004418840629, "title": "老王技术资讯频道", "username_or_link": "@eooce_channel", "is_private": 0, "enabled": 1},
                 {"chat_id": -1002546853359, "title": "Никита Велс | AI", "username_or_link": "https://telegram.me/+frtm7Hh88ss1NDBh", "is_private": 1, "enabled": 1},
@@ -94,7 +96,7 @@ class Database:
                 {"chat_id": -1002966261035, "title": "Vọc VN", "username_or_link": "@vocvnchanel", "is_private": 0, "enabled": 1},
                 {"chat_id": -1002041340502, "title": "SGX", "username_or_link": "@crypto_sgx", "is_private": 0, "enabled": 1},
                 {"chat_id": -1003799671340, "title": "выф", "username_or_link": "@wod304", "is_private": 0, "enabled": 1},
-                {"chat_id": -1002857314478 if False else -1002857314778, "title": "НЕЙРО ПРОФИТ", "username_or_link": "@neuroprft", "is_private": 0, "enabled": 1},
+                {"chat_id": -1002857314778, "title": "НЕЙРО ПРОФИТ", "username_or_link": "@neuroprft", "is_private": 0, "enabled": 1},
                 {"chat_id": -1002671714459, "title": "PK个人频道", "username_or_link": "@pk_oa", "is_private": 0, "enabled": 1},
                 {"chat_id": -1001966291562, "title": "КиберТопор", "username_or_link": "https://t.me/cybers", "is_private": 1, "enabled": 1},
                 {"chat_id": -1001758234692, "title": "XOR", "username_or_link": "@xor_journal", "is_private": 0, "enabled": 1},
@@ -218,19 +220,44 @@ class Database:
             async with db.execute(query, (source_chat_id, *msg_ids)) as cursor:
                 return await cursor.fetchone() is not None
 
-    async def get_recent_post_snippets(self, limit: int = 15) -> list[str]:
-        """Возвращает начала последних постов для проверки смысловых дублей."""
+    async def get_recent_post_snippets(self, limit: int = 35) -> list[str]:
+        """Возвращает чистые текстовые сниппеты последних постов (включая отклонённые) для проверки смысловых дублей."""
+        import re as _re
+
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 """
-                SELECT rewritten_text FROM posts
-                WHERE status IN ('pending', 'published') AND rewritten_text != ''
+                SELECT COALESCE(NULLIF(rewritten_text, ''), original_text) FROM posts
+                WHERE status IN ('pending', 'published', 'rejected')
+                  AND (rewritten_text != '' OR original_text != '')
                 ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
             ) as cursor:
                 rows = await cursor.fetchall()
-                return [r[0][:200] for r in rows if r[0]]
+                snippets: list[str] = []
+                for r in rows:
+                    if not r or not r[0]:
+                        continue
+                    plain = _re.sub(r"</?[a-zA-Z0-9_-]+(?:\s+[^>]*)?>", "", str(r[0]))
+                    plain = _re.sub(r"\s+", " ", plain).strip()
+                    if plain:
+                        snippets.append(plain[:220])
+                return snippets
+
+    async def get_recent_posts_for_dedup(self, limit: int = 80) -> list[tuple[str, str]]:
+        """Возвращает (original_text, rewritten_text) последних постов для быстрой программной дедупликации."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT original_text, rewritten_text FROM posts
+                WHERE (original_text != '' OR rewritten_text != '')
+                ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [(str(r[0] or ""), str(r[1] or "")) for r in rows]
 
     async def create_post(
         self,
