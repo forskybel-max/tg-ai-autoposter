@@ -246,30 +246,38 @@ class AIService:
                 for m in models_raw:
                     methods = m.get("supportedGenerationMethods") or []
                     name = m.get("name", "").removeprefix("models/")
-                    if "generateContent" in methods and "tts" not in name and "image" not in name and "embedding" not in name:
-                        if "hydrogen" in name or "flash" in name:
+                    if (
+                        "generateContent" in methods
+                        and "tts" not in name
+                        and "image" not in name
+                        and "embedding" not in name
+                        and "omni" not in name  # у omni-моделей лимит бесплатного тарифа = 0 (вызывают ложный 429)
+                        and "2.5" not in name
+                        and "2.0" not in name
+                    ):
+                        if "hydrogen" in name or "flash" in name or ("gemma" in name and ("27b" in name or "31b" in name)):
                             candidates.append(name)
-                logger.info("Доступные модели Gemini (Hydrogen/Flash) на ключе: %s", candidates)
+                logger.info("Доступные бесплатные модели Google AI (Hydrogen/Flash/Gemma): %s", candidates)
 
-                # Приоритет: gemini-4-hydrogen (1M контекст, быстрый), затем проверенные 3.5/3.1 Flash
+                # Приоритет: gemini-4-hydrogen -> сверхбыстрые 3.5/3.1 flash-lite -> 3.5-flash -> отдельный пул Gemma (14400 req/day)
                 def _model_rank(name: str) -> tuple[int, str]:
                     if name == "gemini-4-hydrogen" or "hydrogen" in name:
                         return (0, name)
-                    if name == "gemini-3.5-flash":
-                        return (1, name)
                     if name == "gemini-3.5-flash-lite":
-                        return (2, name)
+                        return (1, name)
                     if name == "gemini-3.1-flash-lite":
-                        return (3, name)
+                        return (2, name)
                     if name in ("gemini-flash-lite-latest", "gemini-flash-latest"):
+                        return (3, name)
+                    if name == "gemini-3.5-flash":
                         return (4, name)
-                    if "2.5" in name:
-                        return (9, name)
-                    if "preview" in name or "3.8" in name or "3.7" in name:
-                        return (6, name)
-                    if "lite" in name:
+                    if "gemma-4" in name:
                         return (5, name)
-                    return (5, name)
+                    if "gemma-3" in name or "gemma" in name:
+                        return (6, name)
+                    if "preview" in name or "3.8" in name or "3.7" in name:
+                        return (8, name)
+                    return (7, name)
 
                 candidates.sort(key=_model_rank)
                 self._discovered_gemini_fallbacks = candidates
@@ -292,14 +300,15 @@ class AIService:
         proxy: str | None,
         use_low_thinking: bool = True,
         use_json_schema: bool = True,
-        timeout_sec: float = 35.0,
+        timeout_sec: float = 20.0,
     ) -> str:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={self.config.ai_api_key}"
         )
+        is_gemma = "gemma" in model.lower()
         gen_cfg: dict = {"temperature": 0.25, "maxOutputTokens": 8192}
-        if use_json_schema:
+        if use_json_schema and not is_gemma:
             gen_cfg["responseMimeType"] = "application/json"
             gen_cfg["responseSchema"] = {
                 "type": "OBJECT",
@@ -316,16 +325,24 @@ class AIService:
                     "rewritten_text",
                 ],
             }
-        if use_low_thinking and (
-            "hydrogen" in model or "4" in model or "3.8" in model or "3.7" in model
+        if (
+            use_low_thinking
+            and not is_gemma
+            and ("hydrogen" in model or "4" in model or "3.8" in model or "3.7" in model)
         ):
             gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
 
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig": gen_cfg,
-        }
+        if is_gemma:
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_text}"}]}],
+                "generationConfig": gen_cfg,
+            }
+        else:
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+                "generationConfig": gen_cfg,
+            }
 
         t0 = time.monotonic()
         async with session.post(
@@ -390,23 +407,25 @@ class AIService:
                 fallbacks = await self._discover_gemini_models(session, proxy)
                 last_err: Exception = first_err
                 for fb_model in fallbacks:
-                    if fb_model == primary_model or "2.5" in fb_model:
+                    if fb_model == primary_model or "2.5" in fb_model or "omni" in fb_model:
                         continue
                     try:
                         return await self._call_gemini_single(
-                            session, fb_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=25.0
+                            session, fb_model, system_prompt, user_text, proxy, use_low_thinking=True, use_json_schema=True, timeout_sec=16.0
                         )
                     except Exception as fb_err:
                         fb_lower = str(fb_err).lower()
-                        if "schema" in fb_lower or "mime" in fb_lower:
+                        if "schema" in fb_lower or "mime" in fb_lower or "developer instruction" in fb_lower:
                             try:
                                 return await self._call_gemini_single(
-                                    session, fb_model, system_prompt, user_text, proxy, use_low_thinking=False, use_json_schema=False, timeout_sec=25.0
+                                    session, fb_model, system_prompt, user_text, proxy, use_low_thinking=False, use_json_schema=False, timeout_sec=16.0
                                 )
                             except Exception as fb_err2:
                                 fb_err = fb_err2
                         logger.warning("Резервная модель %s не сработала: %s: %s", fb_model, type(fb_err).__name__, fb_err)
-                        last_err = fb_err
+                        # Не затираем реальную ошибку 503 ошибкой 429 от экспериментальных превью-моделей
+                        if "429" not in str(fb_err) or "429" in str(first_err):
+                            last_err = fb_err
 
                 raise RuntimeError(f"{type(last_err).__name__}: {last_err}") from last_err
 

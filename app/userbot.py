@@ -696,7 +696,8 @@ class UserbotParser:
 
                 ai_result = None
                 last_exc: Exception | None = None
-                for attempt in range(2):
+                retry_delays = (3.5, 9.0, 18.0)
+                for attempt in range(len(retry_delays) + 1):
                     try:
                         ai_result = await self.ai.process_post(
                             original_text=original_text,
@@ -705,14 +706,39 @@ class UserbotParser:
                         break
                     except Exception as exc:
                         last_exc = exc
-                        if attempt == 0:
-                            logger.warning("Повтор обращения к ИИ через 2.5 сек для поста %s из '%s': %s", msg_id, source_title, exc)
-                            await asyncio.sleep(2.5)
+                        if attempt < len(retry_delays):
+                            delay = retry_delays[attempt]
+                            logger.warning(
+                                "Повтор обращения к ИИ (#%d через %.1f сек) для поста %s из '%s': %s",
+                                attempt + 1,
+                                delay,
+                                msg_id,
+                                source_title,
+                                exc,
+                            )
+                            await asyncio.sleep(delay)
 
                 if ai_result is None:
+                    err_desc = f"{type(last_exc).__name__}: {last_exc}".strip(": ")
+                    err_low = err_desc.lower()
+                    is_transient = any(
+                        tok in err_low
+                        for tok in ("503", "unavailable", "high demand", "timeout", "429")
+                    )
+                    if is_transient and not force:
+                        # Снимаем блокировку с альбома/поста: фоновый catch-up sync автоматически
+                        # подхватит и обработает этот пост через ~75 секунд без спама ошибками в чат!
+                        if first_gid is not None:
+                            self._handled_group_ids.discard((chat_id, first_gid))
+                        logger.warning(
+                            "Все модели ИИ временно перегружены для поста %s из '%s' — пост отложен до следующего цикла sync.",
+                            msg_id,
+                            source_title,
+                        )
+                        return
+
                     logger.exception("Сбой при обращении к ИИ: %s", last_exc)
                     import html as _html
-                    err_desc = f"{type(last_exc).__name__}: {last_exc}".strip(": ")
                     recipients = [target_admin_id] if target_admin_id else self.config.admin_ids
                     for adm_id in recipients:
                         try:
